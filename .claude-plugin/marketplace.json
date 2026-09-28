@@ -1,0 +1,12 @@
+{
+  "name": "claude-code-message",
+  "owner": { "name": "claude-code-message contributors" },
+  "plugins": [
+    {
+      "name": "claude-code-message",
+      "source": "./",
+      "description": "Cross-machine SendMessage for Claude Code over SSH",
+      "version": "0.2.8"
+    }
+  ]
+}

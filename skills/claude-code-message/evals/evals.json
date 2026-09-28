@@ -1,0 +1,8 @@
+{
+  "skill_name": "claude-code-message",
+  "evals": [
+    {"id": 1, "prompt": "I'm about to force-push develop in services/billing. Before that, ask the sessions on my other machines whether anyone is writing to that repo — only the ones that could be affected.", "expected_output": "Runs `ccm roster`, picks members whose task or cwd relates to billing, @s only them via SendMessage with a self-contained first line; does not broadcast to everyone.", "files": []},
+    {"id": 2, "prompt": "Tell every session that the shared LLM gateway restarts in 10 minutes and calls will fail meanwhile.", "expected_output": "Uses `ccm broadcast` once with a clear self-contained message; does not loop SendMessage per member.", "files": []},
+    {"id": 3, "prompt": "I just got a new Linux box, ssh alias `box1`. Hook it into the Claude group chat.", "expected_output": "Checks key-based ssh, runs `ccm pair box1 --remote-label box1` from the hub, then `ccm doctor`; reports the result.", "files": []}
+  ]
+}

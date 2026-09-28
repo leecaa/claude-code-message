@@ -1,0 +1,8 @@
+{
+  "name": "claude-code-message",
+  "version": "0.2.8",
+  "description": "Group chat for Claude Code sessions across machines: native SendMessage to any session, broadcasts, task roster, full audit log. Linked over SSH.",
+  "author": { "name": "claude-code-message contributors" },
+  "license": "MIT",
+  "keywords": ["sendmessage", "cross-session", "multi-machine", "ssh", "agents"]
+}

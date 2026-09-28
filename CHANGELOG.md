@@ -1,0 +1,26 @@
+# Changelog
+
+## 0.2.8
+- Security: credential redaction now covers JSON fields, prefixed environment variables (e.g. `PGPASSWORD`), and HTTP Basic authorization headers.
+- Security: native `SendMessage` summaries are redacted before writing to the audit log.
+- Concurrency: cross-process roster updates are synchronized with file locking (`fcntl.flock`).
+- Performance: negative task inference results are cached to avoid repeated 32MB transcript file scans.
+- Performance: `SessionStart` hook avoids blocking on synchronous transcript inference.
+- OSS hygiene & docs: added community disclaimer, platform requirements, PATH guidance, and `SECURITY.md`.
+
+## 0.2.7
+- Redaction also catches keys glued to CJK text.
+
+## 0.2.6
+- Credentials (API keys, tokens, passwords, URL credentials) are redacted from tasks and audit previews before they are stored or shared.
+
+## 0.2.5
+- Group chat: every session registers its current task (hooks), gets the roster at start, leaves on exit; stale entries are swept.
+- `ccm roster`, `ccm send`, `ccm broadcast [--node|--local|--match]`, `ccm task`.
+- Audit log (`ccm log`) on every node: join/leave/task, native sends, relays, CLI sends and broadcasts; all-time counters survive reconnects.
+- Setup: `ccm init`, `ccm pair`, `ccm unpair`, `ccm doctor`; stable `~/.local/bin/ccm` shim that follows the installed plugin.
+- Guard against both machines dialling each other.
+- Session names in any language are kept in mirror names.
+
+## 0.1.0
+- Cross-machine SendMessage: remote sessions mirrored as native peers over an SSH stdio link.
