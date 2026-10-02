@@ -1,6 +1,7 @@
 """Unit tests. Everything runs against a throwaway HOME; no real sessions are touched."""
 import importlib.machinery, importlib.util, io, json, os, socket, subprocess, sys, tempfile, threading, unittest
 from contextlib import redirect_stdout
+from unittest.mock import patch
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 CCM = os.path.join(HERE, "..", "bin", "ccm")
@@ -23,35 +24,59 @@ class FakeSession:
 
     def __init__(self, ccm, name, sid, mirror_of=None):
         self.pid = os.getpid()
-        d = tempfile.mkdtemp(dir="/tmp", prefix="ccmt")
-        self.sock = os.path.join(d, "s.sock")
+        self.temp = tempfile.TemporaryDirectory(prefix="ccmt")
+        self.sock = os.path.join(self.temp.name, "s.sock")
         self.got = []
+        self.stopped = threading.Event()
         self.srv = socket.socket(socket.AF_UNIX); self.srv.bind(self.sock); self.srv.listen(8)
-        threading.Thread(target=self.loop, daemon=True).start()
+        self.srv.settimeout(0.2)
+        self.thread = threading.Thread(target=self.loop, daemon=True)
+        self.thread.start()
+        ccm.test_sessions = getattr(ccm, "test_sessions", []) + [self]
         os.makedirs(ccm.SESSIONS_DIR, exist_ok=True)
-        json.dump({"peerToken": "cd" * 16}, open(ccm.key_path(self.pid, self.sock), "w"))
-        rec = {"pid": self.pid, "sessionId": sid, "name": name, "cwd": "/w", "messagingSocketPath": self.sock, "status": "idle"}
+        ccm.write_json_private(ccm.key_path(self.pid, self.sock), {"peerToken": "cd" * 16})
+        rec = {"pid": self.pid, "sessionId": sid, "name": name, "cwd": "/w", "messagingSocketPath": self.sock,
+               "status": "idle", "procStart": ccm.proc_start(self.pid), "pidDomain": ccm.pid_domain()}
         if mirror_of:
             rec.update(agent="claude-code-message", ccmHost=mirror_of, ccmTask="remote task")
         # one record per pid is a registry rule; tests use distinct fake pid files
         self.reg = os.path.join(ccm.SESSIONS_DIR, f"{self.pid}.json")
-        json.dump(rec, open(self.reg, "w"))
+        ccm.write_json_private(self.reg, rec)
+
+    def close(self):
+        self.stopped.set()
+        self.srv.close()
+        self.thread.join(timeout=2)
+        self.temp.cleanup()
 
     def loop(self):
-        while True:
-            c, _ = self.srv.accept(); buf = b""
-            while True:
-                x = c.recv(65536)
-                if not x: break
-                buf += x
-            if buf.strip():
-                self.got.append([json.loads(l) for l in buf.decode().strip().split("\n")])
+        while not self.stopped.is_set():
+            try:
+                c, _ = self.srv.accept()
+            except socket.timeout:
+                continue
+            except OSError:
+                break
+            with c:
+                buf = b""
+                while True:
+                    x = c.recv(65536)
+                    if not x: break
+                    buf += x
+                if buf.strip():
+                    self.got.append([json.loads(l) for l in buf.decode().strip().split("\n")])
 
 
 class T(unittest.TestCase):
     def setUp(self):
-        self.home = tempfile.mkdtemp()
+        env = patch.dict(os.environ)
+        env.start()
+        self.addCleanup(env.stop)
+        home = tempfile.TemporaryDirectory()
+        self.addCleanup(home.cleanup)
+        self.home = home.name
         self.ccm = load(self.home)
+        self.addCleanup(lambda: [s.close() for s in getattr(self.ccm, "test_sessions", [])])
 
     def test_rewrite_only_touches_header(self):
         body = 'quoted from="uds:/tmp/cc-socks/1.sock" from-name="x"'
@@ -117,7 +142,7 @@ class T(unittest.TestCase):
         auth, frame = target.got[0]
         self.assertEqual(auth, {"type": "auth", "token": "cd" * 16})
         self.assertIn("[broadcast to 1 members] hello all", frame["message"]["content"])
-        self.assertIn('from-mode="default"', frame["message"]["content"])
+        self.assertNotIn('from-mode=', frame["message"]["content"])
         a = [json.loads(l) for l in open(c.AUDITFILE)][-1]
         self.assertEqual((a["ev"], a["to"], a["results"]), ("broadcast", ["server-api"], {"server-api": "ok"}))
         self.assertIn("hello all", a["preview"])

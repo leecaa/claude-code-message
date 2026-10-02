@@ -29,11 +29,11 @@ B 不需要预先准备。`pair` 会把 claude-code-message 复制到 B 的 `~/.
 | 查看消息记录 | `ccm log -n 100`、`ccm log -f`（实时）、`ccm log --ev broadcast` |
 | 升级后重启 | `ccm restart` |
 
-已经在运行的会话要重启一次（`/exit` 后执行 `claude --resume <id>`）才会加载插件的 hooks。重启之前它们照样能收发消息，只是不会登记自己的任务。
+已经在运行的会话需要执行 `/reload-plugins`，或退出后用 `claude --resume <id>` 恢复，才能加载新的 hooks。此前原生消息仍可收发，但 CLI 消息可能缺少当前权限快照。不要为了升级而终止他人的在途会话。
 
 ### 从普通终端发消息
 
-在 Claude 会话之外运行 `ccm send` 或 `ccm broadcast` 时，发件人显示为 `<机器>-cli`，权限模式记为 `default`。bypass 模式的会话收到这类消息时，会先扣下（界面显示 “Held peer message”），等它的用户批准后才处理。这是 Claude Code 权限模式对等规则在正常工作，不是故障。如果要无人值守地协调，请在会话内部发送：agent 通过 Bash 工具发出的消息会带上所在会话的身份和权限模式。
+在 Claude 会话之外运行 `ccm send` 或 `ccm broadcast` 时，发件人显示为 `<机器>-cli`，不声明权限类别。bypass 接收方会先扣下消息，等待用户批准。如果要无人值守协调，请在已加载 hooks 的会话内部发送：CLI 会识别真实的会话祖先进程，并使用 hooks 提供的当前权限模式，不通过启动参数猜测 bypass。权限对等规则及 plan 模式限制见 [消息信任说明](../../MESSAGE-TRUST.md)。
 
 ## 4. 升级
 

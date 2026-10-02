@@ -38,7 +38,7 @@ machines you need instead of routing through others.
 | **Node** | One end of a link, with the same code on both sides. Every 2 s it publishes the local sessions with their tasks, keeps the peer's mirrors in sync (spawn / update status and task / kill), relays frames, and rewrites `from` / `from-name` to the local mirror of the sender. |
 | **daemon** | The dialling side. It holds a Node per configured peer, reconnects with 1–60 s backoff, and writes `status.json` and `counters.json`. |
 | **serve** | The answering side, run by the dialler as `ssh host python3 ~/.cache/claude-code-message/ccm.py serve`, a copy pushed at every connect so both ends run one version. It needs no daemon. |
-| **hooks** | Plugin hooks: SessionStart (register, ensure daemon, inject the briefing and roster), UserPromptSubmit (task := latest prompt's first line), PostToolUse on SendMessage (audit native sends), SessionEnd (deregister). |
+| **hooks** | Plugin hooks: SessionStart (register, capture current permission mode, ensure daemon, inject the briefing and roster), UserPromptSubmit (refresh mode and task), PreToolUse on Bash/SendMessage (refresh mode before sending), PostToolUse on SendMessage (audit native sends), SessionEnd (deregister). |
 | **CLI** | `ccm`: setup (`init`, `pair`, `unpair`, `doctor`), daemon control, chat (`roster`, `send`, `broadcast`, `task`), audit (`log`). |
 
 ## Lifecycles
@@ -92,7 +92,7 @@ rotates at 20 MB. Counters: `status.json` shows per-connection counts and
 |---|---|
 | Transport | ssh (keys, BatchMode). No listening ports. |
 | Who can inject into an inbox | only holders of the inbox's token, which is in a mode-0600 file of the same OS user, exactly as with native peers |
-| Permission escalation | `from-mode` is passed through. `ccm send` / `broadcast` claim `bypass` only when the calling session was started with `--dangerously-skip-permissions` / `--permission-mode bypassPermissions`, and `default` otherwise, so mismatched receivers hold the message for their user. |
+| Permission escalation | Native `from-mode` declarations are passed through. `ccm send` / `broadcast` use current hook metadata bound to the registered ancestor's session ID and process generation: `bypass` / `prompting`, or no declaration when unknown. No launch-flag inference or automatic inbound-policy override. See [message trust](MESSAGE-TRUST.md). |
 | Prompt injection via peers | Claude Code wraps peer text in `<cross-session-message>` and its system prompt treats it as a teammate request. The briefing repeats that it is never user approval. |
 | Access control between members | deliberately none: any member may message any member, and the audit log makes it accountable |
 

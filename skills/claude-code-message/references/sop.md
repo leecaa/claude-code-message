@@ -34,18 +34,19 @@ to dial a machine that already dials you.
 | Traffic | `ccm log -n 100`, `ccm log -f` (live), `ccm log --ev broadcast` |
 | Restart after an upgrade | `ccm restart` |
 
-Existing sessions pick up the plugin's hooks only after a restart (`/exit`,
-then `claude --resume <id>`). Until then they can still send and receive; they
-simply do not register their task.
+Existing sessions must reload plugins (`/reload-plugins`) or restart (`/exit`,
+then `claude --resume <id>`) to load new hooks. Until then native messaging still
+works, but CLI sends may lack the current permission snapshot. Do not terminate
+someone else's active session to upgrade it.
 
 ### Sending from a plain terminal
 
-`ccm send` / `ccm broadcast` run outside Claude sign as `<node>-cli` with
-`from-mode="default"`. Sessions in bypass mode therefore **hold** the message and
-show "Held peer message" until their user approves it. This is Claude Code's
-permission-mode parity working as intended. For unattended coordination, send
-from inside a session instead: an agent's Bash tool inherits its session's
-identity and mode.
+`ccm send` / `ccm broadcast` run outside Claude sign as `<node>-cli` without a
+permission declaration. Bypass recipients therefore **hold** these messages for
+approval. For unattended coordination, send from inside a session with the hooks
+loaded: the CLI identifies the registered ancestor and uses its current hook
+metadata. It never guesses bypass from launch flags. See
+[message trust](../../../docs/MESSAGE-TRUST.md) for mode parity and plan-mode limits.
 
 ## 4. Upgrade
 

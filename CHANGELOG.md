@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.2.9 — 2026-10-02
+- Fix invalid `from-mode="default"` envelopes: CLI sends use hook-attested `bypass`/`prompting` classes, or omit an unknown class.
+- Refresh permission state at session startup, prompts, and before Bash/SendMessage; bind it to a live ancestor session and process generation instead of guessing from launch flags.
+- Serialize registry publication before relaying messages, including a new sender's first message; reject stale process records.
+- Normalize sender display names and percent-encode socket reply addresses while preserving native permission declarations and control frames.
+- Add isolated first/repeated-send, broadcast, mode-transition, and subprocess/socket regression tests and document inbound-policy boundaries.
+
 ## 0.2.8
 - Security: credential redaction now covers JSON fields, prefixed environment variables (e.g. `PGPASSWORD`), and HTTP Basic authorization headers.
 - Security: native `SendMessage` summaries are redacted before writing to the audit log.

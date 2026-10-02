@@ -63,9 +63,28 @@ Other frame types (`"type":"control"`, file attachments) use the same
 envelope. Limit is roughly 1 MB per line. The receiver:
 
 - checks the token (peer or child token),
-- applies **permission-mode parity**: if `from-mode` differs from its own mode,
-  it holds the message for its user's approval,
+- applies **permission-class parity** (`bypass` / `prompting`), unless an explicit
+  inbound policy overrides it; a mismatched class is held, and an undeclared
+  sender is held by a bypass recipient,
 - replies by connecting to the `from` address, which must be a local socket.
+
+## Canonical identity envelope
+
+In 2.1.282 the receiver recognizes a complete, canonical envelope, not arbitrary
+XML. Optional attributes occur in order: `from`, `from-session`, `hop-chain`,
+`from-name`, `from-mode`, `from-plugin`. `from-mode` is **only** `bypass` or
+`prompting`, never the CLI's `default` or `bypassPermissions` spelling. An invalid
+envelope loses its parsed display name and mode, even if the connecting PID is
+verified and the socket write succeeded.
+
+Reply addresses percent-encode characters outside `A-Za-z0-9:_/.\\-` (including
+spaces, non-ASCII characters, `%`, and `~`). Names strip quotes/angle brackets and
+Unicode Cc/Cf/Cs/Zl/Zp characters, trim whitespace, and retain at most 64 code points
+plus an ellipsis. `from-session` is an optional navigation hint, not authentication.
+
+CCM CLI sends take permission state from documented hook input; unknown state is
+omitted rather than guessed. See [message trust](MESSAGE-TRUST.md) for the policy
+matrix, startup-race fix, plan-mode limitation, and validation scope.
 
 ## How Claude Code Message uses this
 

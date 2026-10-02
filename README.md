@@ -57,6 +57,18 @@ member.
 | `ccm status` / `ccm doctor` | health (counters survive reconnects) |
 | `ccm pair` / `unpair` / `up` / `down` / `restart` | lifecycle |
 
+## Message trust and first delivery
+
+For an agent's `ccm send` / `ccm broadcast`, hooks capture its **current** permission
+mode before the first send and subsequent sends. Native `SendMessage` declarations
+are preserved. CCM does not label unknown senders as bypass or change
+`crossSessionInbound`; matching classes deliver under Claude's default policy,
+while mismatched/unknown classes may still require approval.
+
+If you see “unidentified session” or “did not attest its permission mode”, see
+[Message identity and troubleshooting](docs/MESSAGE-TRUST.md), including upgrade
+steps and the limits of “trusted Claude” on a shared OS account.
+
 ## Docs
 
 - [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md): design, lifecycles, audit
@@ -87,6 +99,6 @@ they need to see each other.
 
 ## Test
 
-`python3 tests/test_ccm.py`
+`python3 -m unittest discover -s tests -v`
 
 License: MIT

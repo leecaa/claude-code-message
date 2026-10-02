@@ -6,7 +6,7 @@
       "name": "claude-code-message",
       "source": "./",
       "description": "Cross-machine SendMessage for Claude Code over SSH",
-      "version": "0.2.8"
+      "version": "0.2.9"
     }
   ]
 }

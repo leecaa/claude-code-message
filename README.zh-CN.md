@@ -39,6 +39,16 @@ ccm doctor
 | `ccm status` / `ccm doctor` | 健康检查（计数器在断线重连后不清零） |
 | `ccm pair` / `unpair` / `up` / `down` / `restart` | 生命周期管理 |
 
+## 消息信任与首次发送
+
+agent 通过 `ccm send` / `ccm broadcast` 发消息时，hooks 会在首次及后续发送前记录**当前**权限模式，不再通过进程启动参数猜测。原生 `SendMessage` 的权限声明则原样保留；新会话先公布身份再转发消息，不需要先发一条消息“预热”。
+
+看到 `unidentified session` / `did not attest its permission mode` 时，应更新插件并重新加载 hooks 或重启会话。旧版 `from-mode="default"` 不符合协议；修复后只发送 `bypass` / `prompting`，无法确认时不声明权限类别。仅修改源码不会更新已安装插件或运行中的中继。
+
+**可信身份不等于无条件授权**：默认策略下，权限类别相同的消息直接投递，不同类别或未知来源仍可能需要批准。CCM 不会伪装 bypass，也不自动设置全局 `crossSessionInbound="accept"`（该选项会放行所有入站消息，不能只筛出“由 Claude 发起”的消息）。普通 shell、无可验证祖先进程的后台进程，以及权限信息不足的 plan 模式，不会被冒充成 bypass 会话。plan 模式建议用原生 `SendMessage`。
+
+详见 [消息身份、修复原理与验证边界](docs/MESSAGE-TRUST.md)。命令返回 `ok` 只证明 socket 写入成功，是否真正送达需要接收方确认。
+
 ## 文档
 
 - [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)：设计、生命周期、审计字段、安全（英文，单一事实来源）
@@ -59,6 +69,6 @@ Claude Code Message 依赖 Claude Code 的**内部**协议（在 2.1.282 上测�
 
 ## 测试
 
-`python3 tests/test_ccm.py`
+`python3 -m unittest discover -s tests -v`
 
 许可证：MIT
