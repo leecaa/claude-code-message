@@ -101,4 +101,9 @@ they need to see each other.
 
 `python3 -m unittest discover -s tests -v`
 
+## Community & Acknowledgements
+
+- Discussion & Support: [LINUX DO](https://linux.do)
+
 License: MIT
+

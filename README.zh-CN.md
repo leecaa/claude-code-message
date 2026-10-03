@@ -71,4 +71,9 @@ Claude Code Message 依赖 Claude Code 的**内部**协议（在 2.1.282 上测�
 
 `python3 -m unittest discover -s tests -v`
 
+## 社区认可与交流
+
+- 讨论支持：[LINUX DO](https://linux.do)
+
 许可证：MIT
+
