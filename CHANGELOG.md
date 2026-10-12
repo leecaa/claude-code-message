@@ -10,6 +10,8 @@
 - Bound route metadata and message retention, reclaim expired routes without a new roster, and recover reusable SQLite capacity while retaining live messages and replay tombstones.
 - Preserve per-node relay audit and counters, and add isolated disconnect, replay, CLI/mirror, SQLite, concurrency and subprocess-crash regression tests.
 - Add Agent Bridge (`ccm agent serve`, `ccm agent wait`, `ccm agent status`, `ccm agent stop`) enabling non-Claude agents (Google Antigravity, OpenAI Codex, and external autonomous agents) to register as interactive peers, receive incoming messages via stdout/FIFO/inbox/exec, and interoperate across the CCM messaging fabric.
+- Add `--as` identity binding and single-agent auto-binding to `ccm send` and `ccm broadcast`, allowing external agents to sign outbound messages with their registered peer identities.
+- Add smart `<node>-cli` alias resolution and actionable diagnostics in `resolve()`, preventing unknown member failures when replying to CLI/agent messages.
 - Add comprehensive Agent Bridge architecture specifications in `docs/AGENT-BRIDGE.md` and `docs/i18n/zh-CN/AGENT-BRIDGE.md`.
 - This is an unreleased source candidate; changing a checkout does not upgrade installed plugins or running bridges.
 

@@ -33,7 +33,7 @@ ccm doctor
 | 命令 | 说明 |
 |---|---|
 | `ccm roster` | 成员、所在机器、在做什么 |
-| `ccm send 名字 内容` / `ccm broadcast 内容 [--node N] [--local] [--match 正则]` | 从命令行或 agent 的 Bash 发消息 |
+| `ccm send 名字 内容 [--as 身份]` / `ccm broadcast 内容 [--as 身份] [--node N] [--local] [--match 正则]` | 从命令行或 agent 的 Bash 发消息 |
 | `ccm task [内容]` | 查看或设置当前会话的任务 |
 | `ccm agent serve` / `wait` / `status` / `stop` | 将 Antigravity、Codex 及外部 Agent 桥接为对等成员 |
 | `ccm log [-f] [-n N] [--ev 事件,…]` | 审计日志 |

@@ -161,6 +161,12 @@ ccm agent status [name]
 ccm agent stop <name>
 ```
 
+### 4.5. 发件身份绑定与 `<node>-cli` 智能解析 (`--as`)
+外部 Agent 或脚本在非 Claude 会话环境中调用 `ccm send` / `ccm broadcast` 时：
+* `--as <name>`（或环境变量 `CCM_AS` / `CCM_AGENT_NAME`）：明确指定以特定 Agent Bridge 身份发信，自动绑定该 Agent 的真实 UDS 路径（`from="uds:..."`）、会话 ID 及名称到消息信封中。
+* **单桥接自动绑定**：若未显式传参 `--as`，且调用者不具备 Claude 祖先进程，CCM 会在当前节点仅运行单个活跃 Agent Bridge 时自动推断并绑定该 Agent 身份。
+* **`<node>-cli` 智能别名与诊断**：当对端会话依据信封默认标签回复 `<node>-cli` 时，CCM 会自动将其别名路由到该节点唯一的活跃 Agent Bridge；若无桥接运行，则输出清晰诊断提示而非生硬的 `unknown member` 报错。
+
 ---
 
 ## 5. 安全、脱敏与生命周期清理

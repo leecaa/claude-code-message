@@ -51,7 +51,7 @@ member.
 | Command | |
 |---|---|
 | `ccm roster` | members, where they run, what they work on |
-| `ccm send NAME TEXT` / `ccm broadcast TEXT [--node N] [--local] [--match RE]` | message from the CLI or from an agent's Bash |
+| `ccm send NAME TEXT [--as AGENT]` / `ccm broadcast TEXT [--as AGENT] [--node N] [--local] [--match RE]` | message from the CLI or from an agent's Bash |
 | `ccm task [TEXT]` | show or set this session's task |
 | `ccm agent serve` / `wait` / `status` / `stop` | bridge Antigravity, Codex & external agents as interactive peers |
 | `ccm log [-f] [-n N] [--ev E,…]` | audit trail |

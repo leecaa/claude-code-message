@@ -170,6 +170,59 @@ class AgentBridgeTests(unittest.TestCase):
         self.assertEqual(saved["from_name"], "reviewer")
         self.assertIn("Deliverable ready", saved["text"])
 
+    def test_whoami_agent_and_custom_sender(self):
+        c = self.c
+        pid = 99999
+        sock = "/tmp/cc-socks/99999.sock"
+        sid = "agent-my-agent-99999"
+        reg = {
+            "pid": pid, "sessionId": sid, "cwd": self.temp.name,
+            "startedAt": 1000, "procStart": "Mon Oct 12 00:00:00 2026",
+            "version": "ccm-agent-0.3.0", "peerProtocol": 1,
+            "messagingSocketPath": sock, "name": "my-agent", "agent": "ccm-agent-antigravity",
+            "status": "idle", "ccmTask": "Test task"
+        }
+        with patch.object(c, "read_sessions", return_value=[reg]):
+            # Test exact match
+            matched = c.whoami_agent("my-agent")
+            self.assertIsNotNone(matched)
+            self.assertEqual(matched["name"], "my-agent")
+
+            # Test single agent auto-bind
+            auto_matched = c.whoami_agent()
+            self.assertIsNotNone(auto_matched)
+            self.assertEqual(auto_matched["name"], "my-agent")
+
+            # Test build_frame with agent session
+            frame, sender = c.build_frame(matched, "Hello World")
+            self.assertEqual(sender, "my-agent")
+            self.assertIn('from-name="my-agent"', frame["message"]["content"])
+            self.assertIn(f'from-session="{sid}"', frame["message"]["content"])
+
+            # Test build_frame with custom_sender when me is None
+            frame2, sender2 = c.build_frame(None, "Hello World", custom_sender="custom-bot")
+            self.assertEqual(sender2, "custom-bot")
+            self.assertIn('from-name="custom-bot"', frame2["message"]["content"])
+
+    def test_resolve_cli_alias(self):
+        c = self.c
+        label = c.load_config()["label"]
+        cli_target = f"{label}-cli"
+
+        agent_member = {
+            "pid": 88888, "sessionId": "agent-worker-88888", "name": "worker",
+            "messagingSocketPath": "/tmp/cc-socks/88888.sock"
+        }
+
+        # Case 1: Exactly 1 agent bridge on local node -> auto alias
+        resolved = c.resolve(cli_target, [agent_member])
+        self.assertEqual(resolved["name"], "worker")
+
+        # Case 2: No agent bridge on local node -> descriptive exit
+        with self.assertRaises(SystemExit) as cm:
+            c.resolve(cli_target, [])
+        self.assertIn("is an ephemeral CLI sender label", str(cm.exception))
+
 
 if __name__ == "__main__":
     unittest.main()

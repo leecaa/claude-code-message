@@ -184,6 +184,12 @@ Gracefully terminates a running agent daemon:
 ccm agent stop <name>
 ```
 
+### 4.5. Outbound Identity & Ephemeral CLI Routing (`--as`)
+When sending messages from scripts or external agent runtimes outside an interactive Claude session:
+* `--as <name>` (or env `CCM_AS` / `CCM_AGENT_NAME`): Explicitly sends as a registered agent bridge (or custom name), binding the agent's real socket address (`from="uds:..."`), session ID, and display name into the XML envelope.
+* **Auto-Binding**: If `--as` is omitted and the caller is not inside a Claude session, CCM automatically binds to the local agent bridge if exactly one is active on the node.
+* **Smart `<node>-cli` Resolution**: When a peer replies to an ephemeral `<node>-cli` sender, CCM automatically aliases the delivery to the single active agent bridge on that node, preventing `unknown member` failures. If no bridge is running, it yields an actionable diagnostic error.
+
 ---
 
 ## 5. Security & Boundary Guardrails

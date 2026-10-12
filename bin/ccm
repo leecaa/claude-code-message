@@ -2181,6 +2181,20 @@ def whoami():
     return next((sessions[pid] for pid in ancestor_pids() if pid in sessions), None)
 
 
+def whoami_agent(as_name=None):
+    """Find an active agent bridge session matching as_name or single active local bridge."""
+    local_agents = [r for r in read_sessions() if (r.get("sessionId") or "").startswith("agent-")]
+    if as_name:
+        t = as_name.lower()
+        matched = [r for r in local_agents if (r.get("name") or "").lower() == t or r.get("sessionId") == f"agent-{as_name}-{r.get('pid')}"]
+        if matched:
+            return matched[0]
+        return None
+    if len(local_agents) == 1:
+        return local_agents[0]
+    return None
+
+
 def permission_mode(rec):
     """Use the last hook's current mode, never launch flags or a guessed bypass."""
     saved = (roster_get(rec.get("sessionId")) or {}).get("permission") or {}
@@ -2205,9 +2219,10 @@ def peer_address(sock):
     return "uds:" + quote(sock, safe=":/_-.\\").replace("~", "%7E")
 
 
-def build_frame(me, text):
+def build_frame(me, text, custom_sender=None):
     label = load_config()["label"]
-    name = peer_name(display_name(me) if me else f"{label}-cli")
+    default_name = custom_sender or f"{label}-cli"
+    name = peer_name(display_name(me) if me else default_name)
     attrs = []
     if me:
         attrs.append(f'from="{peer_address(me["messagingSocketPath"])}"')
@@ -2236,6 +2251,19 @@ def resolve(target, members):
     pref = [m for m in members if (m.get("name") or "").lower().startswith(t)]
     if len(pref) == 1:
         return pref[0]
+    if t.endswith("-cli"):
+        node = t[:-4]
+        label = (load_config().get("label") or "").lower()
+        if node == label:
+            local_agents = [m for m in members if not is_mirror(m) and (m.get("sessionId") or "").startswith("agent-")]
+            if len(local_agents) == 1:
+                return local_agents[0]
+        else:
+            remote_agents = [m for m in members if is_mirror(m) and (m.get("ccmHost") or "").lower() == node and (m.get("sessionId") or "").startswith("agent-")]
+            if len(remote_agents) == 1:
+                return remote_agents[0]
+        names = ", ".join(sorted(m.get("name") or "?" for m in (pref or members)))
+        sys.exit(f"unknown member '{target}': '{target}' is an ephemeral CLI sender label, not an active receiver session. Run 'ccm agent serve {target}' or send to an active member. Candidates: {names}")
     names = ", ".join(sorted(m.get("name") or "?" for m in (pref or members)))
     sys.exit(f"{'ambiguous' if pref else 'unknown'} member '{target}'. Candidates: {names}")
 
@@ -2279,10 +2307,17 @@ def attempt_delivery(store,row,target,explicit=True):
 
 def cmd_send(a):
     me = whoami()
+    as_name = getattr(a, "as_agent", None) or os.environ.get("CCM_AS") or os.environ.get("CCM_AGENT_NAME")
+    if not me:
+        me = whoami_agent(as_name)
+    elif as_name:
+        agent_me = whoami_agent(as_name)
+        if agent_me:
+            me = agent_me
     members = [r for r in read_sessions(include_mirrors=True) if not me or r["pid"] != me["pid"]]
     store=ReliabilityStore()
     target = resolve_delivery(a.to,members,store)
-    frame,sender=build_frame(me,read_text(a))
+    frame,sender=build_frame(me,read_text(a),custom_sender=as_name)
     row=store.enqueue([{"peer":target.get("ccmHost") if is_mirror(target) else "@local","sid":target["sessionId"]}],frame,me)[0]
     try:
         if row["target_peer"]=="@local":
@@ -2298,6 +2333,13 @@ def cmd_send(a):
 
 def cmd_broadcast(a):
     me = whoami()
+    as_name = getattr(a, "as_agent", None) or os.environ.get("CCM_AS") or os.environ.get("CCM_AGENT_NAME")
+    if not me:
+        me = whoami_agent(as_name)
+    elif as_name:
+        agent_me = whoami_agent(as_name)
+        if agent_me:
+            me = agent_me
     label = load_config()["label"]
     members = [r for r in read_sessions(include_mirrors=True) if not me or r["pid"] != me["pid"]]
     if a.local:
@@ -2309,7 +2351,7 @@ def cmd_broadcast(a):
     if not members:
         sys.exit("nobody to broadcast to")
     text = read_text(a)
-    frame,sender=build_frame(me,f"[broadcast to {len(members)} members] {text}")
+    frame,sender=build_frame(me,f"[broadcast to {len(members)} members] {text}",custom_sender=as_name)
     if len({(r.get("ccmHost") if is_mirror(r) else "@local",r.get("sessionId")) for r in members})!=len(members):
         sys.exit("broadcast target identities are ambiguous")
     store=ReliabilityStore();group=str(uuid.uuid4())
@@ -3164,9 +3206,11 @@ def main():
     sp.add_parser("ensure").set_defaults(fn=cmd_ensure)
     p = sp.add_parser("status"); p.add_argument("--json", action="store_true"); p.set_defaults(fn=cmd_status)
     p = sp.add_parser("roster", aliases=["peers"], help="members and their tasks"); p.add_argument("--json", action="store_true"); p.set_defaults(fn=cmd_roster)
-    p = sp.add_parser("send", help="@ one member"); p.add_argument("to"); p.add_argument("text", nargs="*"); p.set_defaults(fn=cmd_send)
+    p = sp.add_parser("send", help="@ one member"); p.add_argument("to"); p.add_argument("text", nargs="*")
+    p.add_argument("--as", dest="as_agent", help="send as a registered agent or custom sender name"); p.set_defaults(fn=cmd_send)
     p = sp.add_parser("broadcast", help="message everyone"); p.add_argument("text", nargs="*"); p.add_argument("--local", action="store_true")
-    p.add_argument("--node"); p.add_argument("--match", help="regex on member names"); p.set_defaults(fn=cmd_broadcast)
+    p.add_argument("--node"); p.add_argument("--match", help="regex on member names")
+    p.add_argument("--as", dest="as_agent", help="send as a registered agent or custom sender name"); p.set_defaults(fn=cmd_broadcast)
     p = sp.add_parser("task", help="show/set this session's task"); p.add_argument("text", nargs="*"); p.set_defaults(fn=cmd_task)
     p = sp.add_parser("log", help="audit trail"); p.add_argument("-n", type=int, default=40); p.add_argument("-f", "--follow", action="store_true")
     p.add_argument("--ev"); p.add_argument("--json", action="store_true"); p.set_defaults(fn=cmd_log)
