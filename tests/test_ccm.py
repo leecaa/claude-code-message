@@ -25,7 +25,13 @@ class FakeSession:
     def __init__(self, ccm, name, sid, mirror_of=None):
         self.pid = os.getpid()
         self.temp = tempfile.TemporaryDirectory(prefix="ccmt")
-        self.sock = os.path.join(self.temp.name, "s.sock")
+        self.directory_fd = None
+        directory = self.temp.name
+        # Keep the actual fixtures in TMPDIR even when its path exceeds sockaddr_un.
+        if sys.platform.startswith("linux") and len(os.fsencode(directory)) > 85:
+            self.directory_fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY)
+            directory = f"/proc/{self.pid}/fd/{self.directory_fd}"
+        self.sock = os.path.join(directory, "s.sock")
         self.got = []
         self.stopped = threading.Event()
         self.srv = socket.socket(socket.AF_UNIX); self.srv.bind(self.sock); self.srv.listen(8)
@@ -34,7 +40,8 @@ class FakeSession:
         self.thread.start()
         ccm.test_sessions = getattr(ccm, "test_sessions", []) + [self]
         os.makedirs(ccm.SESSIONS_DIR, exist_ok=True)
-        ccm.write_json_private(ccm.key_path(self.pid, self.sock), {"peerToken": "cd" * 16})
+        ccm.write_json_private(ccm.key_path(self.pid, self.sock), {
+            "peerToken": "cd" * 16, "procStart": ccm.proc_start(self.pid), "pidDomain": ccm.pid_domain()})
         rec = {"pid": self.pid, "sessionId": sid, "name": name, "cwd": "/w", "messagingSocketPath": self.sock,
                "status": "idle", "procStart": ccm.proc_start(self.pid), "pidDomain": ccm.pid_domain()}
         if mirror_of:
@@ -48,6 +55,8 @@ class FakeSession:
         self.srv.close()
         self.thread.join(timeout=2)
         self.temp.cleanup()
+        if self.directory_fd is not None:
+            os.close(self.directory_fd)
 
     def loop(self):
         while not self.stopped.is_set():
@@ -144,7 +153,13 @@ class T(unittest.TestCase):
         self.assertIn("[broadcast to 1 members] hello all", frame["message"]["content"])
         self.assertNotIn('from-mode=', frame["message"]["content"])
         a = [json.loads(l) for l in open(c.AUDITFILE)][-1]
-        self.assertEqual((a["ev"], a["to"], a["results"]), ("broadcast", ["server-api"], {"server-api": "ok"}))
+        self.assertEqual((a["ev"], a["to"]), ("broadcast", ["server-api"]))
+        result = a["results"]["server-api"]
+        self.assertEqual(result["state"], "queued")
+        self.assertEqual(result["native_msg_id"], frame["msg_id"])
+        stored = c.ReliabilityStore().outbox_rows("server")
+        self.assertEqual(len(stored), 1)
+        self.assertEqual((stored[0]["id"], stored[0]["group_id"]), (result["delivery_id"], a["group_id"]))
         self.assertIn("hello all", a["preview"])
         rows = c.roster_rows()
         self.assertEqual((rows[0]["node"], rows[0]["task"]), ("server", "remote task"))
@@ -190,7 +205,7 @@ class T(unittest.TestCase):
         c = self.ccm
         FakeSession(c, "server-uat", "r1", mirror_of="server")
         buf = io.StringIO()
-        with redirect_stdout(buf):
+        with redirect_stdout(buf), patch.object(c, "ensure_daemon"):
             c.hook_session_start({"session_id": "me", "cwd": "/w", "source": "startup"})
         out = json.loads(buf.getvalue())["hookSpecificOutput"]
         self.assertEqual(out["hookEventName"], "SessionStart")

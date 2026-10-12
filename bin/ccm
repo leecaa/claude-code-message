@@ -15,7 +15,12 @@ import argparse
 import fcntl
 import hashlib
 import json
+import math
 import os
+import random
+import sqlite3
+import stat
+from contextlib import contextmanager
 import re
 import secrets
 import signal
@@ -28,7 +33,7 @@ import unicodedata
 import uuid
 from urllib.parse import quote, unquote
 
-VERSION = "0.2.9"
+VERSION = "0.3.0"
 PROTO = 1
 MIRROR_TAG = "claude-code-message"
 MAX_FRAME = 1_048_576
@@ -50,6 +55,24 @@ REMOTE_SCRIPT = "~/.cache/claude-code-message/ccm.py"
 REMOTE_HOME = "~/.local/share/claude-code-message"
 PLUGIN_ID = "claude-code-message@claude-code-message"
 PLUGIN_ROOT = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
+RELIABILITY_DB = os.path.join(STATE_DIR, "reliability.sqlite3")
+RELIABILITY_IDENTITY = os.path.join(STATE_DIR, "reliability-identity.json")
+RELIABILITY_SCHEMA = 1
+RELIABILITY_DEFAULTS = {
+    "read_receipts": True, "retry_enabled": True, "retry_initial": 2.0,
+    "retry_max": 300.0, "retry_jitter": 0.2, "ack_wait": 10.0,
+    "max_attempts": 512, "message_ttl": 86400.0, "max_active_messages": 10000,
+    "max_payload_bytes": 64 * 1024 * 1024, "max_store_bytes": 256 * 1024 * 1024,
+    "ack_reserve_bytes": 4 * 1024 * 1024, "clock_skew": 300.0,
+    "tombstone_margin": 172800.0,
+}
+RELIABILITY_RANGES = {
+    "retry_initial": (0.1, 300), "retry_max": (1, 3600), "retry_jitter": (0, 0.5),
+    "ack_wait": (0.1, 300), "max_attempts": (1, 10000), "message_ttl": (1, 86400),
+    "max_active_messages": (1, 100000), "max_payload_bytes": (1024, 1024 ** 3),
+    "max_store_bytes": (1024 * 1024, 2 * 1024 ** 3), "ack_reserve_bytes": (4096, 64 * 1024 * 1024),
+    "clock_skew": (0, 300), "tombstone_margin": (3600, 604800),
+}
 IS_LINUX = sys.platform.startswith("linux")
 LOG_TAG = ""
 
@@ -76,9 +99,22 @@ def write_json_private(path, obj):
     os.makedirs(os.path.dirname(path), mode=0o700, exist_ok=True)
     tmp = f"{path}.tmp.{secrets.token_hex(4)}"
     fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-    with os.fdopen(fd, "w") as f:
-        json.dump(obj, f, ensure_ascii=False)
-    os.replace(tmp, path)
+    try:
+        with os.fdopen(fd, "w") as f:
+            json.dump(obj, f, ensure_ascii=False, allow_nan=False)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+        directory = os.open(os.path.dirname(path), os.O_RDONLY)
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)
+    finally:
+        try:
+            os.unlink(tmp)
+        except FileNotFoundError:
+            pass
 
 
 def read_json(path, default=None):
@@ -89,16 +125,852 @@ def read_json(path, default=None):
         return default
 
 
-def load_config():
-    cfg = read_json(CONFIG_PATH) or {}
+class ReliabilityError(RuntimeError):
+    pass
+
+
+def validate_config(cfg):
+    if not isinstance(cfg, dict):
+        raise ReliabilityError("configuration must be an object")
+    cfg = dict(cfg)
     cfg.setdefault("label", default_label())
     cfg.setdefault("peers", [])
     cfg.setdefault("audit_preview_chars", 160)
+    cfg.setdefault("policy_revision", 0)
+    if not isinstance(cfg["label"], str) or not isinstance(cfg["peers"], list):
+        raise ReliabilityError("invalid node configuration")
+    if type(cfg["audit_preview_chars"]) is not int or not 0 <= cfg["audit_preview_chars"] <= 100000:
+        raise ReliabilityError("invalid preview size")
+    if type(cfg["policy_revision"]) is not int or cfg["policy_revision"] < 0:
+        raise ReliabilityError("invalid policy revision")
+    for key in cfg:
+        if (key.startswith("retry_") or key.startswith("receipt_")) and key not in RELIABILITY_DEFAULTS:
+            raise ReliabilityError("unknown reliability setting")
+    for key, default in RELIABILITY_DEFAULTS.items():
+        cfg.setdefault(key, default)
+        value = cfg[key]
+        if type(default) is bool:
+            if type(value) is not bool:
+                raise ReliabilityError(key + " must be a JSON boolean")
+        else:
+            if type(value) not in (int, float) or not math.isfinite(value):
+                raise ReliabilityError(key + " must be finite")
+            if type(default) is int and type(value) is not int:
+                raise ReliabilityError(key + " must be an integer")
+            low, high = RELIABILITY_RANGES[key]
+            if not low <= value <= high:
+                raise ReliabilityError(key + " outside supported range")
+    if cfg["retry_initial"] > cfg["retry_max"] or cfg["ack_reserve_bytes"] >= cfg["max_store_bytes"] // 4:
+        raise ReliabilityError("inconsistent reliability limits")
     return cfg
 
 
+def load_config():
+    try:
+        with open(CONFIG_PATH) as f:
+            cfg = json.load(f, parse_constant=lambda _: (_ for _ in ()).throw(ValueError("non-finite JSON")))
+    except FileNotFoundError:
+        cfg = {}
+    except (OSError, ValueError) as e:
+        raise ReliabilityError("configuration unreadable or invalid; sending paused") from e
+    return validate_config(cfg)
+
+
 def save_config(cfg):
+    cfg = validate_config(cfg)
+    store = ReliabilityStore()
+    revision = store.begin_policy_update(suppress_read=not cfg["read_receipts"])
+    cfg["policy_revision"] = revision
     write_json_private(CONFIG_PATH, cfg)
+    store.finish_policy_update(cfg)
+    return cfg
+
+
+# -------------------------------------------------------------- reliability
+
+def canonical_json(value):
+    return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False)
+
+
+def generation(rec):
+    return {key: rec.get(key) for key in ("pid", "procStart", "pidDomain")}
+
+
+def safe_identifier(value):
+    return isinstance(value, str) and bool(re.fullmatch(r"[A-Za-z0-9_.:-]{1,128}", value))
+
+
+class ReliabilityStore:
+    """Private, bounded ledger. Native IO is deliberately outside its transactions."""
+    def __init__(self, directory=None, clock=None, rng=None):
+        self.directory = directory or STATE_DIR
+        self.path = os.path.join(self.directory, "reliability.sqlite3")
+        self.identity_path = os.path.join(self.directory, "reliability-identity.json")
+        self.clock = clock or time.time
+        self.rng = rng or random.SystemRandom()
+        os.makedirs(self.directory, mode=0o700, exist_ok=True)
+        d = os.lstat(self.directory)
+        if not stat.S_ISDIR(d.st_mode) or d.st_uid != os.getuid():
+            raise ReliabilityError("reliability state directory must be owned and regular")
+        # Older roster creation could leave this owned data directory at 0755.
+        if d.st_mode & 0o077:
+            os.chmod(self.directory,0o700)
+        lock_path = os.path.join(self.directory, "reliability.lock")
+        lock = os.open(lock_path, os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0), 0o600)
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            if not os.path.exists(self.path):
+                fd = os.open(self.path, os.O_RDWR | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), 0o600)
+                os.close(fd)
+            s = os.lstat(self.path)
+            if not stat.S_ISREG(s.st_mode) or s.st_uid != os.getuid() or stat.S_IMODE(s.st_mode) != 0o600:
+                raise ReliabilityError("reliability database must be a private regular file")
+            self._file_identity = (s.st_dev,s.st_ino)
+            if os.path.lexists(self.identity_path):
+                marker_stat = os.lstat(self.identity_path)
+                if not stat.S_ISREG(marker_stat.st_mode) or marker_stat.st_uid != os.getuid() or stat.S_IMODE(marker_stat.st_mode) != 0o600:
+                    raise ReliabilityError("identity marker must be private and regular")
+            with self.connection() as db:
+                version = db.execute("PRAGMA user_version").fetchone()[0]
+                if version not in (0, RELIABILITY_SCHEMA):
+                    raise ReliabilityError("unsupported reliability database schema")
+                db.executescript("""
+                    CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+                    CREATE TABLE IF NOT EXISTS peers (
+                        channel TEXT PRIMARY KEY, node_id TEXT NOT NULL, incarnation TEXT NOT NULL,
+                        label TEXT NOT NULL, disposition TEXT NOT NULL DEFAULT 'bound');
+                    CREATE TABLE IF NOT EXISTS routes (
+                        peer TEXT NOT NULL, sid TEXT NOT NULL, name TEXT NOT NULL,
+                        binding TEXT NOT NULL, observed REAL NOT NULL, PRIMARY KEY(peer,sid));
+                    CREATE TABLE IF NOT EXISTS outbox (
+                        id TEXT PRIMARY KEY, native_id TEXT NOT NULL, source_sid TEXT NOT NULL,
+                        source_generation TEXT, target_peer TEXT NOT NULL, target_sid TEXT NOT NULL,
+                        target_generation TEXT, frame TEXT, payload_bytes INTEGER NOT NULL,
+                        fingerprint TEXT NOT NULL, created REAL NOT NULL, expires REAL NOT NULL,
+                        retain_until REAL NOT NULL, read_requested INTEGER NOT NULL, group_id TEXT,
+                        peer_node TEXT, peer_inc TEXT, channel TEXT, mode TEXT NOT NULL DEFAULT 'unbound',
+                        transport TEXT NOT NULL DEFAULT 'queued', native_state TEXT NOT NULL DEFAULT 'none',
+                        admission TEXT NOT NULL DEFAULT 'unknown', acknowledged INTEGER NOT NULL DEFAULT 0,
+                        disposition TEXT NOT NULL DEFAULT 'enabled', attempts INTEGER NOT NULL DEFAULT 0,
+                        next_at REAL NOT NULL, attempt_owner TEXT, attempt_until REAL,
+                        explicit_seen INTEGER NOT NULL DEFAULT 0,
+                        legacy_started INTEGER NOT NULL DEFAULT 0,
+                        UNIQUE(target_peer,native_id));
+                    CREATE TABLE IF NOT EXISTS inbox (
+                        origin_node TEXT NOT NULL, origin_inc TEXT NOT NULL, id TEXT NOT NULL,
+                        native_id TEXT NOT NULL, source_sid TEXT NOT NULL, source_generation TEXT,
+                        target_sid TEXT NOT NULL, target_generation TEXT, frame TEXT,
+                        payload_bytes INTEGER NOT NULL, fingerprint TEXT NOT NULL,
+                        created REAL NOT NULL, expires REAL NOT NULL, retain_until REAL NOT NULL,
+                        read_requested INTEGER NOT NULL, peer TEXT NOT NULL, channel TEXT,
+                        native_state TEXT NOT NULL DEFAULT 'waiting_target', admission TEXT NOT NULL DEFAULT 'unknown',
+                        acknowledged INTEGER NOT NULL DEFAULT 0, disclosure TEXT NOT NULL DEFAULT 'none',
+                        disposition TEXT NOT NULL DEFAULT 'enabled', attempts INTEGER NOT NULL DEFAULT 0,
+                        next_at REAL NOT NULL, dispatch_owner TEXT, dispatch_pid INTEGER,
+                        dispatch_start TEXT, dispatch_domain TEXT, dispatch_revision INTEGER,
+                        PRIMARY KEY(origin_node,origin_inc,id),
+                        UNIQUE(origin_node,origin_inc,native_id));
+                    CREATE TABLE IF NOT EXISTS receipts (
+                        id TEXT PRIMARY KEY, origin_node TEXT NOT NULL, origin_inc TEXT NOT NULL,
+                        delivery_id TEXT NOT NULL, peer TEXT NOT NULL, channel TEXT,
+                        peer_node TEXT NOT NULL, peer_inc TEXT NOT NULL, kind TEXT NOT NULL,
+                        payload TEXT NOT NULL, state TEXT NOT NULL DEFAULT 'pending',
+                        attempts INTEGER NOT NULL DEFAULT 0, next_at REAL NOT NULL,
+                        expires REAL NOT NULL, retain_until REAL NOT NULL,
+                        owner TEXT, owner_until REAL, revision INTEGER,
+                        explicit_seen INTEGER NOT NULL DEFAULT 0,
+                        privacy_suppressed INTEGER NOT NULL DEFAULT 0,
+                        send_kind TEXT NOT NULL DEFAULT 'regular', reactive_next_at REAL NOT NULL DEFAULT 0,
+                        UNIQUE(origin_node,origin_inc,delivery_id,kind));
+                    CREATE TABLE IF NOT EXISTS native_status_pending (
+                        id TEXT PRIMARY KEY, delivery_id TEXT NOT NULL, peer_node TEXT NOT NULL,
+                        peer_inc TEXT NOT NULL, channel TEXT, source_sid TEXT NOT NULL,
+                        source_generation TEXT NOT NULL, target_sid TEXT NOT NULL,
+                        target_generation TEXT NOT NULL, native_id TEXT NOT NULL,
+                        status TEXT NOT NULL, observed REAL NOT NULL, retain_until REAL NOT NULL);
+                    CREATE TABLE IF NOT EXISTS explicit_grants (
+                        token TEXT PRIMARY KEY, delivery_id TEXT NOT NULL, peer TEXT NOT NULL,
+                        owner_sid TEXT NOT NULL, owner_generation TEXT NOT NULL, purpose TEXT NOT NULL,
+                        created REAL NOT NULL, expires REAL NOT NULL, used INTEGER NOT NULL DEFAULT 0);
+                    CREATE INDEX IF NOT EXISTS outbox_due ON outbox(target_peer,next_at);
+                    CREATE INDEX IF NOT EXISTS inbox_due ON inbox(next_at);
+                    CREATE INDEX IF NOT EXISTS receipt_due ON receipts(peer,next_at);
+                """)
+                db.execute("BEGIN IMMEDIATE")
+                try:
+                    existing = dict(db.execute("SELECT key,value FROM meta"))
+                    marker = None
+                    try:
+                        with open(self.identity_path) as f:
+                            marker = json.load(f)
+                    except FileNotFoundError:
+                        pass
+                    except (OSError, ValueError) as e:
+                        raise ReliabilityError("reliability identity marker invalid") from e
+                    node_id = existing.get("node_id") or (marker or {}).get("node_id") or str(uuid.uuid4())
+                    incarnation = existing.get("incarnation") or str(uuid.uuid4())
+                    if existing.get("incarnation") and marker and (marker.get("incarnation"),marker.get("node_id")) != (incarnation,node_id):
+                        raise ReliabilityError("database identity changed; reconciliation required")
+                    self.node_id, self.incarnation = node_id, incarnation
+                    cfg = load_config()
+                    initial = {"node_id":node_id, "incarnation":incarnation, "policy_revision":str(cfg["policy_revision"]),
+                               "read_enabled":"1" if cfg["read_receipts"] else "0", "retry_enabled":"1" if cfg["retry_enabled"] else "0",
+                               "policy_pending":"0", "last_wall":str(self.clock())}
+                    for key, value in initial.items():
+                        db.execute("INSERT OR IGNORE INTO meta VALUES (?,?)", (key,value))
+                    db.execute("PRAGMA user_version=%d" % RELIABILITY_SCHEMA)
+                    db.execute("COMMIT")
+                except BaseException:
+                    db.execute("ROLLBACK")
+                    raise
+            write_json_private(self.identity_path, {"node_id":self.node_id,"incarnation":self.incarnation})
+        finally:
+            fcntl.flock(lock, fcntl.LOCK_UN)
+            os.close(lock)
+
+    @contextmanager
+    def connection(self):
+        s = os.lstat(self.path)
+        if not stat.S_ISREG(s.st_mode) or s.st_uid != os.getuid() or stat.S_IMODE(s.st_mode) != 0o600 or (s.st_dev,s.st_ino) != self._file_identity:
+            raise ReliabilityError("reliability database changed; sending paused")
+        uri = "file:" + quote(os.path.abspath(self.path),safe="/") + "?mode=rw"
+        db = sqlite3.connect(uri, uri=True, timeout=5, isolation_level=None)
+        db.row_factory = sqlite3.Row
+        try:
+            db.execute("PRAGMA journal_mode=DELETE")
+            db.execute("PRAGMA synchronous=FULL")
+            db.execute("PRAGMA busy_timeout=5000")
+            db.execute("PRAGMA secure_delete=ON")
+            cfg = load_config()
+            page = db.execute("PRAGMA page_size").fetchone()[0]
+            db.execute("PRAGMA max_page_count=%d" % max(32, cfg["max_store_bytes"] // (2 * page)))
+            yield db
+        finally:
+            db.close()
+
+    @contextmanager
+    def transaction(self):
+        with self.connection() as db:
+            db.execute("BEGIN IMMEDIATE")
+            try:
+                yield db
+                db.execute("COMMIT")
+            except BaseException:
+                db.execute("ROLLBACK")
+                raise
+
+    def _clock(self, db):
+        now = self.clock()
+        if not math.isfinite(now):
+            raise ReliabilityError("clock is not finite")
+        last = float(db.execute("SELECT value FROM meta WHERE key='last_wall'").fetchone()[0])
+        if now < last - 0.001:
+            raise ReliabilityError("clock rolled back; sending paused")
+        db.execute("UPDATE meta SET value=? WHERE key='last_wall'", (str(max(now,last)),))
+        return now
+
+    def _policy(self, db):
+        cfg = load_config()
+        values = dict(db.execute("SELECT key,value FROM meta WHERE key IN ('policy_revision','read_enabled','retry_enabled','policy_pending')"))
+        revision = int(values["policy_revision"])
+        if cfg["policy_revision"] != revision or values["policy_pending"] == "1":
+            raise ReliabilityError("privacy/retry policy update incomplete; sending paused")
+        # A manual edit may disable policy, but cannot silently re-enable old disclosure.
+        read = cfg["read_receipts"] and values["read_enabled"] == "1"
+        retry = cfg["retry_enabled"] and values["retry_enabled"] == "1"
+        if not cfg["read_receipts"]:
+            db.execute("UPDATE meta SET value='0' WHERE key='read_enabled'")
+            db.execute("UPDATE receipts SET privacy_suppressed=1 WHERE kind='receiver_acknowledged' AND state!='received'")
+            db.execute("UPDATE receipts SET state='suppressed' WHERE kind='receiver_acknowledged' AND state IN ('pending','reserved')")
+            db.execute("UPDATE inbox SET disclosure='suppressed' WHERE acknowledged=1 AND disclosure='pending'")
+        if not cfg["retry_enabled"]:
+            db.execute("UPDATE meta SET value='0' WHERE key='retry_enabled'")
+            db.execute("UPDATE outbox SET disposition='paused_retry_disabled' WHERE disposition='enabled'")
+            db.execute("UPDATE inbox SET disposition='paused_retry_disabled' WHERE disposition='enabled' AND native_state IN ('waiting_target','waiting_source_route','prewrite_failed')")
+        return cfg, read, retry, revision
+
+    def begin_policy_update(self, suppress_read=False):
+        with self.transaction() as db:
+            if suppress_read:
+                db.execute("UPDATE receipts SET privacy_suppressed=1 WHERE kind='receiver_acknowledged' AND state!='received'")
+            revision = int(db.execute("SELECT value FROM meta WHERE key='policy_revision'").fetchone()[0]) + 1
+            db.execute("UPDATE meta SET value='1' WHERE key='policy_pending'")
+            db.execute("UPDATE meta SET value=? WHERE key='policy_revision'", (str(revision),))
+            return revision
+
+    def finish_policy_update(self, cfg):
+        with self.transaction() as db:
+            expected = int(db.execute("SELECT value FROM meta WHERE key='policy_revision'").fetchone()[0])
+            if expected != cfg["policy_revision"]:
+                raise ReliabilityError("configuration revision changed")
+            if not cfg["read_receipts"]:
+                db.execute("UPDATE receipts SET privacy_suppressed=1 WHERE kind='receiver_acknowledged' AND state!='received'")
+                db.execute("UPDATE receipts SET state='suppressed' WHERE kind='receiver_acknowledged' AND state IN ('pending','reserved')")
+                db.execute("UPDATE inbox SET disclosure='suppressed' WHERE acknowledged=1 AND disclosure='pending'")
+            for key,value in (("read_enabled",cfg["read_receipts"]),("retry_enabled",cfg["retry_enabled"])):
+                db.execute("UPDATE meta SET value=? WHERE key=?", ("1" if value else "0",key))
+            if cfg["retry_enabled"]:
+                db.execute("UPDATE outbox SET disposition='enabled' WHERE disposition='paused_retry_disabled'")
+                db.execute("UPDATE inbox SET disposition='enabled' WHERE disposition='paused_retry_disabled' AND native_state IN ('waiting_target','waiting_source_route','prewrite_failed')")
+            else:
+                db.execute("UPDATE outbox SET disposition='paused_retry_disabled' WHERE disposition='enabled'")
+                db.execute("UPDATE inbox SET disposition='paused_retry_disabled' WHERE disposition='enabled' AND native_state IN ('waiting_target','waiting_source_route','prewrite_failed')")
+            db.execute("UPDATE meta SET value='0' WHERE key='policy_pending'")
+
+    def _capacity(self, db, cfg, additional_bytes=0, control=False):
+        page_size=db.execute("PRAGMA page_size").fetchone()[0]
+        pages=db.execute("PRAGMA page_count").fetchone()[0]
+        free=db.execute("PRAGMA freelist_count").fetchone()[0]
+        growth=max(0,math.ceil(additional_bytes/page_size)-free)
+        reserve=max(cfg["ack_reserve_bytes"],8*page_size)
+        return {"pages":pages,"free":free,"required_bytes":2*(pages+growth)*page_size,
+                "available_bytes":cfg["max_store_bytes"]-(0 if control else reserve)}
+
+    def _budget(self, db, frames, metadata_rows=1, control=False):
+        cfg = load_config()
+        count = sum(db.execute("SELECT COUNT(*) FROM " + t + " WHERE frame IS NOT NULL").fetchone()[0] for t in ("outbox","inbox"))
+        size = sum(db.execute("SELECT COALESCE(SUM(payload_bytes),0) FROM " + t + " WHERE frame IS NOT NULL").fetchone()[0] for t in ("outbox","inbox"))
+        if count + len(frames) > cfg["max_active_messages"] or size + sum(frames) > cfg["max_payload_bytes"]:
+            raise ReliabilityError("active message budget exhausted")
+        capacity=self._capacity(db,cfg,sum(frames)+4096*metadata_rows,control)
+        if capacity["required_bytes"] > capacity["available_bytes"]:
+            raise ReliabilityError("total reliability store budget exhausted")
+
+    def _fingerprint(self, item):
+        immutable = {key:item.get(key) for key in ("source_sid","source_generation","target_sid","frame","created","expires","read_requested")}
+        return hashlib.sha256(canonical_json(immutable).encode()).hexdigest()
+
+    def bind_peer(self, channel, label, node_id, incarnation):
+        if not channel or not all(safe_identifier(x) for x in (node_id,incarnation)):
+            raise ReliabilityError("invalid paired channel identity")
+        with self.transaction() as db:
+            old = db.execute("SELECT * FROM peers WHERE channel=?",(channel,)).fetchone()
+            if old and (old["node_id"],old["incarnation"],old["label"]) != (node_id,incarnation,label):
+                db.execute("UPDATE peers SET disposition='needs_reconcile' WHERE channel=?",(channel,))
+                db.execute("UPDATE outbox SET disposition='needs_reconcile' WHERE channel=?",(channel,))
+                return False
+            if old and old["disposition"] != "bound":
+                return False
+            db.execute("INSERT OR IGNORE INTO peers(channel,node_id,incarnation,label) VALUES (?,?,?,?)",(channel,node_id,incarnation,label))
+            return True
+
+    def peer(self, channel):
+        with self.connection() as db:
+            row = db.execute("SELECT * FROM peers WHERE channel=?",(channel,)).fetchone()
+            return dict(row) if row else None
+
+    def _gc_routes(self, db, now):
+        # Cache retirement must not redirect still-live queued targets or depend on a new roster.
+        db.execute("""DELETE FROM routes WHERE observed<? AND NOT EXISTS
+            (SELECT 1 FROM outbox WHERE target_peer=routes.peer AND target_sid=routes.sid AND expires>?)""",(now-86400,now))
+
+    def remember_routes(self, peer, records):
+        accepted=0;rejected=0
+        with self.transaction() as db:
+            now=self._clock(db)
+            self._gc_routes(db,now)
+            for rec in records:
+                sid=rec.get("sessionId")
+                if not safe_identifier(sid):
+                    rejected+=1;continue
+                name=display_name(rec)
+                if not isinstance(name,str) or len(name.encode())>1024:
+                    rejected+=1;continue
+                binding=canonical_json(generation(rec))
+                old=db.execute("SELECT 1 FROM routes WHERE peer=? AND sid=?",(peer,sid)).fetchone()
+                if not old and db.execute("SELECT COUNT(*) FROM routes").fetchone()[0]>=10000:
+                    rejected+=1;continue
+                try:
+                    self._budget(db,[],metadata_rows=1)
+                except ReliabilityError:
+                    rejected+=1;continue
+                db.execute("INSERT OR REPLACE INTO routes VALUES (?,?,?,?,?)",(peer,sid,name,binding,now));accepted+=1
+        return {"accepted":accepted,"rejected":rejected,"truncated":bool(rejected)}
+
+    def cached_routes(self):
+        with self.connection() as db:
+            return [dict(row) for row in db.execute("SELECT * FROM routes")]
+
+    def enqueue(self, targets, frame, source=None, group_id=None):
+        return self.enqueue_batch([(target,frame) for target in targets],source,group_id)
+
+    def enqueue_batch(self, deliveries, source=None, group_id=None):
+        source = source or {}
+        entries = []
+        with self.transaction() as db:
+            now = self._clock(db); cfg,read,retry,revision = self._policy(db)
+            for target,frame in deliveries:
+                if not isinstance(frame,dict) or frame.get("type") != "user" or not safe_identifier(frame.get("msg_id")):
+                    raise ReliabilityError("only identified user messages can be queued")
+                encoded = canonical_json(frame)
+                if len(encoded.encode()) + 4096 > MAX_FRAME:
+                    raise ReliabilityError("message too large")
+                peer,sid = target["peer"],target["sid"]
+                if not safe_identifier(sid) or not isinstance(peer,str) or not peer:
+                    raise ReliabilityError("target must have a fixed peer and SID")
+                existing = db.execute("SELECT * FROM outbox WHERE target_peer=? AND native_id=?",(peer,frame["msg_id"])).fetchone()
+                if existing:
+                    if existing["target_sid"] != sid or existing["source_sid"] != (source.get("sessionId") or "") or existing["frame"] != encoded or existing["source_generation"] != canonical_json(generation(source)):
+                        raise ReliabilityError("native message ID conflict")
+                    entries.append(dict(existing));continue
+                item = {"source_sid":source.get("sessionId") or "", "source_generation":canonical_json(generation(source)),
+                        "target_sid":sid,"frame":frame,"created":now,"expires":now+cfg["message_ttl"],"read_requested":read}
+                self._budget(db,[len(encoded.encode())],metadata_rows=2)
+                delivery_id = str(uuid.uuid4())
+                db.execute("""INSERT INTO outbox(id,native_id,source_sid,source_generation,target_peer,target_sid,
+                    frame,payload_bytes,fingerprint,created,expires,retain_until,read_requested,group_id,next_at,disposition)
+                    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    (delivery_id,frame["msg_id"],item["source_sid"],item["source_generation"],peer,sid,encoded,len(encoded.encode()),
+                     self._fingerprint(item),now,item["expires"],item["expires"]+cfg["clock_skew"]+cfg["tombstone_margin"],int(read),group_id,now,
+                     "enabled" if retry else "paused_retry_disabled"))
+                entries.append(dict(db.execute("SELECT * FROM outbox WHERE id=?",(delivery_id,)).fetchone()))
+        return entries
+
+    def claim_explicit_notice(self, table, item_id):
+        if table not in ("outbox", "receipts"):
+            raise ReliabilityError("invalid explicit notice")
+        with self.transaction() as db:
+            cursor = db.execute("UPDATE " + table + " SET explicit_seen=1 WHERE id=? AND explicit_seen=0",(item_id,))
+            return cursor.rowcount == 1
+
+    def outbox_rows(self, peer=None):
+        with self.connection() as db:
+            rows = db.execute("SELECT * FROM outbox" + (" WHERE target_peer=?" if peer else ""), (peer,) if peer else ())
+            return [dict(row) for row in rows]
+
+    def _delay(self, cfg, attempts):
+        base = min(cfg["retry_max"],cfg["retry_initial"] * 2 ** min(max(0,attempts-1),30))
+        return max(0.01,base * self.rng.uniform(1-cfg["retry_jitter"],1+cfg["retry_jitter"]))
+
+    def reserve_outgoing(self, delivery_id, channel, peer_identity, mode, explicit=False):
+        with self.transaction() as db:
+            now=self._clock(db);cfg,read,retry,revision=self._policy(db)
+            row=db.execute("SELECT * FROM outbox WHERE id=?",(delivery_id,)).fetchone()
+            if not row or row["transport"] in ("peer_received","legacy_socket_written_unconfirmed") or row["disposition"] in ("terminal","needs_reconcile") or row["admission"] in ("held","denied","refused","dropped","expired"):
+                return None
+            if row["expires"] <= now:
+                db.execute("UPDATE outbox SET disposition='terminal' WHERE id=?",(delivery_id,));return None
+            if not retry and not explicit:
+                return None
+            if row["attempts"] >= cfg["max_attempts"]:
+                db.execute("UPDATE outbox SET disposition='terminal' WHERE id=?",(delivery_id,));return None
+            if row["next_at"] > now and not explicit:
+                return None
+            if row["attempt_until"] and row["attempt_until"] > now:
+                return None
+            if row["mode"] == "legacy" and row["legacy_started"]:
+                return None
+            if row["mode"] not in ("unbound",mode):
+                db.execute("UPDATE outbox SET disposition='needs_reconcile' WHERE id=?",(delivery_id,));return None
+            node,inc = peer_identity if peer_identity else (None,None)
+            if row["peer_node"] and (row["peer_node"],row["peer_inc"]) != (node,inc):
+                db.execute("UPDATE outbox SET disposition='needs_reconcile' WHERE id=?",(delivery_id,));return None
+            owner=str(uuid.uuid4());attempts=row["attempts"]+1
+            db.execute("""UPDATE outbox SET mode=?,channel=?,peer_node=?,peer_inc=?,attempts=?,attempt_owner=?,
+                attempt_until=?,next_at=?,disposition=? WHERE id=?""",
+                (mode,channel,node,inc,attempts,owner,now+cfg["ack_wait"],now+self._delay(cfg,attempts),
+                 "enabled" if retry else "paused_retry_disabled",delivery_id))
+            updated=dict(db.execute("SELECT * FROM outbox WHERE id=?",(delivery_id,)).fetchone());updated["policy_revision"]=revision
+            return updated
+
+    def outgoing_send_allowed(self, attempt, explicit=False):
+        with self.transaction() as db:
+            cfg,read,retry,revision=self._policy(db);now=self._clock(db)
+            row=db.execute("SELECT * FROM outbox WHERE id=?",(attempt["id"],)).fetchone()
+            if not row or row["attempt_owner"]!=attempt["attempt_owner"] or revision!=attempt["policy_revision"] or row["transport"]!="queued" or row["disposition"] in ("terminal","needs_reconcile") or row["expires"]<=now or not retry and not explicit:
+                return False
+            if row["mode"]=="legacy":
+                if row["legacy_started"]:
+                    return False
+                db.execute("UPDATE outbox SET legacy_started=1 WHERE id=?",(row["id"],))
+            return True
+
+    def outgoing_envelope(self, row):
+        return {"op":"reliable_deliver","schema":RELIABILITY_SCHEMA,"origin_node_id":self.node_id,
+                "store_incarnation":self.incarnation,"delivery_id":row["id"],"source_sid":row["source_sid"],
+                "source_generation":json.loads(row["source_generation"]),"target_sid":row["target_sid"],
+                "frame":json.loads(row["frame"]),"created":row["created"],"expires":row["expires"],
+                "read_requested":bool(row["read_requested"]),"fingerprint":row["fingerprint"]}
+
+    def outgoing_finished(self, delivery_id, owner, outcome):
+        with self.transaction() as db:
+            row=db.execute("SELECT * FROM outbox WHERE id=?",(delivery_id,)).fetchone()
+            if not row or row["attempt_owner"] != owner:
+                return False
+            if row["mode"] == "legacy" and row["legacy_started"]:
+                # A legacy write or write exception is never made replayable by an upgrade.
+                db.execute("UPDATE outbox SET transport='legacy_socket_written_unconfirmed',disposition='terminal',attempt_until=NULL WHERE id=?",(delivery_id,))
+            elif outcome != "sent":
+                db.execute("UPDATE outbox SET attempt_until=NULL WHERE id=?",(delivery_id,))
+            return True
+
+    def peer_received(self, delivery_id, peer_identity, target_sid):
+        with self.transaction() as db:
+            row=db.execute("SELECT * FROM outbox WHERE id=?",(delivery_id,)).fetchone()
+            if not row or row["mode"] != "durable" or (row["peer_node"],row["peer_inc"],row["target_sid"]) != (peer_identity[0],peer_identity[1],target_sid):
+                return False
+            db.execute("UPDATE outbox SET transport='peer_received',attempt_until=NULL WHERE id=?",(delivery_id,))
+            return True
+
+    def _receipt(self, db, item, kind, payload):
+        receipt_id=hashlib.sha256((item["origin_node"]+":"+item["origin_inc"]+":"+item["id"]+":"+kind).encode()).hexdigest()
+        self._budget(db,[],metadata_rows=1,control=True)
+        db.execute("""INSERT OR IGNORE INTO receipts(id,origin_node,origin_inc,delivery_id,peer,channel,peer_node,peer_inc,
+            kind,payload,next_at,expires,retain_until) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (receipt_id,item["origin_node"],item["origin_inc"],item["id"],item["peer"],item["channel"],item["origin_node"],item["origin_inc"],
+             kind,canonical_json(payload),self.clock(),item["expires"],item["retain_until"]))
+        return receipt_id
+
+    def accept(self, envelope, peer, channel, peer_identity, legacy=False):
+        with self.transaction() as db:
+            now=self._clock(db);cfg,read,retry,revision=self._policy(db)
+            if legacy:
+                frame=envelope["frame"];native=frame.get("msg_id")
+                if not safe_identifier(native):
+                    raise ReliabilityError("legacy message lacks a stable ID")
+                old=db.execute("SELECT * FROM inbox WHERE origin_node=? AND origin_inc=? AND native_id=?",
+                               (peer_identity[0],peer_identity[1],native)).fetchone()
+                envelope=dict(envelope,origin_node_id=peer_identity[0],store_incarnation=peer_identity[1],delivery_id=native,
+                              created=old["created"] if old else now,expires=old["expires"] if old else now+cfg["message_ttl"],read_requested=False)
+            origin,inc,delivery=(envelope.get(k) for k in ("origin_node_id","store_incarnation","delivery_id"))
+            if (origin,inc) != tuple(peer_identity) or not all(safe_identifier(x) for x in (origin,inc,delivery,envelope.get("target_sid"))):
+                raise ReliabilityError("invalid origin or target binding")
+            frame=envelope.get("frame")
+            if not isinstance(frame,dict) or frame.get("type") != "user" or not safe_identifier(frame.get("msg_id")):
+                raise ReliabilityError("invalid reliable user frame")
+            if type(envelope.get("read_requested")) is not bool:
+                raise ReliabilityError("invalid receipt request")
+            created,expires=envelope.get("created"),envelope.get("expires")
+            if any(type(x) not in (int,float) or not math.isfinite(x) for x in (created,expires)) or not 0 < expires-created <= 86400 or created > now+cfg["clock_skew"]:
+                raise ReliabilityError("invalid message lifetime or clock")
+            if expires <= now:
+                raise ReliabilityError("message expired")
+            item={"source_sid":envelope.get("source_sid") or "","source_generation":canonical_json(envelope.get("source_generation") or {}),
+                  "target_sid":envelope["target_sid"],"frame":frame,"created":created,"expires":expires,"read_requested":envelope["read_requested"]}
+            fingerprint=self._fingerprint(item)
+            if not legacy and envelope.get("fingerprint") != fingerprint:
+                raise ReliabilityError("message fingerprint mismatch")
+            encoded=canonical_json(frame);size=len(encoded.encode())
+            if len(canonical_json(envelope).encode())+4096 > MAX_FRAME:
+                raise ReliabilityError("reliable envelope too large")
+            old=db.execute("SELECT * FROM inbox WHERE origin_node=? AND origin_inc=? AND id=?",(origin,inc,delivery)).fetchone()
+            mapped=db.execute("SELECT * FROM inbox WHERE origin_node=? AND origin_inc=? AND native_id=?",(origin,inc,frame["msg_id"])).fetchone()
+            if old or mapped:
+                existing=old or mapped
+                if existing["fingerprint"] != fingerprint or existing["id"] != delivery:
+                    raise ReliabilityError("delivery ID conflict")
+                return dict(existing),False
+            self._budget(db,[size],metadata_rows=3)
+            db.execute("""INSERT INTO inbox(origin_node,origin_inc,id,native_id,source_sid,source_generation,target_sid,frame,payload_bytes,
+                fingerprint,created,expires,retain_until,read_requested,peer,channel,next_at,disposition)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (origin,inc,delivery,frame["msg_id"],item["source_sid"],item["source_generation"],item["target_sid"],encoded,size,fingerprint,
+                 created,expires,expires+cfg["clock_skew"]+cfg["tombstone_margin"],int(item["read_requested"]),peer,channel,now,
+                 "enabled" if retry else "paused_retry_disabled"))
+            row=dict(db.execute("SELECT * FROM inbox WHERE origin_node=? AND origin_inc=? AND id=?",(origin,inc,delivery)).fetchone())
+            if not legacy:
+                self._receipt(db,row,"peer_received",{"target_sid":row["target_sid"]})
+            return row,True
+
+    def inbox_rows(self):
+        with self.connection() as db:
+            return [dict(r) for r in db.execute("SELECT * FROM inbox")]
+
+    def claim_native(self, key, target, explicit=False):
+        with self.transaction() as db:
+            now=self._clock(db);cfg,read,retry,revision=self._policy(db)
+            row=db.execute("SELECT * FROM inbox WHERE origin_node=? AND origin_inc=? AND id=?",key).fetchone()
+            if not row or row["native_state"] not in ("waiting_target","waiting_source_route","prewrite_failed") or row["disposition"] in ("terminal","needs_reconcile") or row["admission"] in ("held","denied","refused","dropped","expired") or row["acknowledged"]:
+                return None
+            if row["expires"] <= now or row["attempts"] >= cfg["max_attempts"]:
+                db.execute("UPDATE inbox SET disposition='terminal',native_state='expired' WHERE origin_node=? AND origin_inc=? AND id=?",key);return None
+            if (not retry and not explicit) or (row["next_at"] > now and not explicit):
+                return None
+            if target.get("sessionId") != row["target_sid"]:
+                raise ReliabilityError("native target SID changed")
+            owner=str(uuid.uuid4())
+            db.execute("""UPDATE inbox SET native_state='native_dispatching',dispatch_owner=?,dispatch_pid=?,dispatch_start=?,dispatch_domain=?,
+                dispatch_revision=?,target_generation=?,attempts=attempts+1 WHERE origin_node=? AND origin_inc=? AND id=?""",
+                (owner,os.getpid(),proc_start(os.getpid()),pid_domain(),revision,canonical_json(generation(target)),*key))
+            return dict(db.execute("SELECT * FROM inbox WHERE origin_node=? AND origin_inc=? AND id=?",key).fetchone())
+
+    def prewrite_allowed(self, key, owner):
+        with self.transaction() as db:
+            cfg,read,retry,revision=self._policy(db)
+            row=db.execute("SELECT * FROM inbox WHERE origin_node=? AND origin_inc=? AND id=?",key).fetchone()
+            return bool(row and row["native_state"]=="native_dispatching" and row["dispatch_owner"]==owner and row["dispatch_pid"]==os.getpid()
+                        and row["dispatch_start"]==proc_start(os.getpid()) and row["dispatch_domain"]==pid_domain() and row["dispatch_revision"]==revision
+                        and row["expires"]>self._clock(db) and db.execute("SELECT value FROM meta WHERE key='policy_pending'").fetchone()[0]=="0")
+
+    def native_finished(self, key, owner, result):
+        with self.transaction() as db:
+            now=self._clock(db);cfg,read,retry,revision=self._policy(db)
+            row=db.execute("SELECT * FROM inbox WHERE origin_node=? AND origin_inc=? AND id=?",key).fetchone()
+            if not row or row["dispatch_owner"]!=owner or row["native_state"]!="native_dispatching" or row["dispatch_pid"]!=os.getpid() or row["dispatch_start"]!=proc_start(os.getpid()):
+                return False
+            state=result["state"]
+            if state not in ("prewrite_failed","socket_written_unconfirmed","handoff_unknown"):
+                state="handoff_unknown"
+            disposition="enabled" if state=="prewrite_failed" and retry else ("paused_retry_disabled" if state=="prewrite_failed" else "needs_reconcile" if state=="handoff_unknown" else "terminal")
+            db.execute("UPDATE inbox SET native_state=?,disposition=?,next_at=? WHERE origin_node=? AND origin_inc=? AND id=?",
+                       (state,disposition,now+self._delay(cfg,row["attempts"]),*key))
+            if state in ("socket_written_unconfirmed","handoff_unknown") and not row["origin_node"].startswith("legacy:"):
+                saved=dict(db.execute("SELECT * FROM inbox WHERE origin_node=? AND origin_inc=? AND id=?",key).fetchone())
+                self._receipt(db,saved,"native_handoff",{"target_sid":saved["target_sid"],"target_generation":json.loads(saved["target_generation"]),"native_state":state})
+            return True
+
+    def recover_dispatches(self):
+        with self.transaction() as db:
+            rows=list(db.execute("SELECT * FROM inbox WHERE native_state='native_dispatching'"))
+            for row in rows:
+                if not row["dispatch_pid"] or not pid_alive(row["dispatch_pid"]) or proc_start(row["dispatch_pid"]) != row["dispatch_start"] or pid_domain()!=row["dispatch_domain"]:
+                    key=(row["origin_node"],row["origin_inc"],row["id"])
+                    db.execute("UPDATE inbox SET native_state='handoff_unknown',disposition='needs_reconcile' WHERE origin_node=? AND origin_inc=? AND id=?",key)
+                    if row["target_generation"] and not row["origin_node"].startswith("legacy:"):
+                        self._receipt(db,dict(row),"native_handoff",{"target_sid":row["target_sid"],"target_generation":json.loads(row["target_generation"]),"native_state":"handoff_unknown"})
+
+    def waiting(self, key, state):
+        with self.transaction() as db:
+            db.execute("UPDATE inbox SET native_state=? WHERE origin_node=? AND origin_inc=? AND id=? AND native_state IN ('waiting_target','waiting_source_route','prewrite_failed')",(state,*key))
+
+    def acknowledge(self, delivery_id, owner_rec):
+        with self.transaction() as db:
+            now=self._clock(db);cfg,read,retry,revision=self._policy(db)
+            rows=list(db.execute("SELECT * FROM inbox WHERE id=? AND target_sid=?",(delivery_id,owner_rec.get("sessionId"))))
+            if len(rows)!=1:
+                raise ReliabilityError("acknowledgement requires the owned target SID")
+            row=rows[0]
+            if row["native_state"] not in ("socket_written_unconfirmed","handoff_unknown"):
+                raise ReliabilityError("no native handoff to acknowledge")
+            if row["target_generation"]!=canonical_json(generation(owner_rec)):
+                raise ReliabilityError("acknowledgement generation mismatch")
+            key=(row["origin_node"],row["origin_inc"],row["id"])
+            if row["acknowledged"]:
+                return False
+            disclosure="pending" if read and row["read_requested"] else "suppressed"
+            db.execute("UPDATE inbox SET acknowledged=1,disclosure=? WHERE origin_node=? AND origin_inc=? AND id=?",(disclosure,*key))
+            if disclosure=="pending":
+                self._receipt(db,dict(row),"receiver_acknowledged",{"target_sid":row["target_sid"],"target_generation":json.loads(row["target_generation"]),"declared_at":now})
+            return True
+
+    def receipt_rows(self, peer=None):
+        with self.connection() as db:
+            rows=db.execute("SELECT * FROM receipts"+(" WHERE peer=?" if peer else ""),(peer,) if peer else ())
+            return [dict(r) for r in rows]
+
+    def reserve_receipt(self, receipt_id, explicit=False, reactive=False):
+        with self.transaction() as db:
+            now=self._clock(db);cfg,read,retry,revision=self._policy(db)
+            row=db.execute("SELECT * FROM receipts WHERE id=?",(receipt_id,)).fetchone()
+            allowed_states=("pending","reserved","sending","received") if reactive else ("pending","reserved","sending")
+            if not row or row["state"] not in allowed_states or reactive and row["kind"]!="peer_received":
+                return None
+            if row["kind"]=="receiver_acknowledged" and (not read or row["privacy_suppressed"]):
+                db.execute("UPDATE receipts SET state='suppressed' WHERE id=?",(receipt_id,));return None
+            if not retry and not explicit and not reactive:
+                return None
+            if row["expires"]<=now or row["attempts"]>=cfg["max_attempts"]:
+                if row["state"]!="received":db.execute("UPDATE receipts SET state='expired' WHERE id=?",(receipt_id,))
+                return None
+            due=row["reactive_next_at"] if reactive else row["next_at"]
+            if (not explicit and due>now) or row["owner_until"] and row["owner_until"]>now:
+                return None
+            owner=str(uuid.uuid4());attempts=row["attempts"]+1;deadline=now+self._delay(cfg,attempts)
+            state=row["state"] if reactive else "reserved"
+            db.execute("UPDATE receipts SET state=?,send_kind=?,owner=?,owner_until=?,revision=?,attempts=?,next_at=?,reactive_next_at=? WHERE id=?",
+                       (state,"reactive" if reactive else "regular",owner,now+cfg["ack_wait"],revision,attempts,
+                        row["next_at"] if reactive else deadline,deadline,receipt_id))
+            return dict(db.execute("SELECT * FROM receipts WHERE id=?",(receipt_id,)).fetchone())
+
+    def receipt_send_allowed(self, receipt):
+        with self.transaction() as db:
+            cfg,read,retry,revision=self._policy(db)
+            row=db.execute("SELECT * FROM receipts WHERE id=?",(receipt["id"],)).fetchone()
+            reactive=row and row["send_kind"]=="reactive"
+            allowed=bool(row and row["owner"]==receipt["owner"] and row["revision"]==revision and (row["state"] in ("pending","reserved","sending","received") if reactive else row["state"]=="reserved"))
+            if row and row["kind"]=="receiver_acknowledged" and (not read or row["privacy_suppressed"]):
+                db.execute("UPDATE receipts SET state='suppressed' WHERE id=?",(row["id"],));return False
+            if allowed and not reactive:
+                db.execute("UPDATE receipts SET state='sending' WHERE id=?",(row["id"],))
+            return allowed
+
+    def receipt_finished(self, receipt_id, owner):
+        with self.transaction() as db:
+            cfg,read,retry,revision=self._policy(db)
+            row=db.execute("SELECT * FROM receipts WHERE id=? AND owner=?",(receipt_id,owner)).fetchone()
+            if row and (row["send_kind"]=="reactive" or row["state"]=="received"):
+                db.execute("UPDATE receipts SET owner_until=NULL WHERE id=?",(receipt_id,))
+                return
+            if row and row["state"]=="sending":
+                state="suppressed" if row["kind"]=="receiver_acknowledged" and (not read or row["revision"]!=revision or row["privacy_suppressed"]) else "pending"
+                db.execute("UPDATE receipts SET owner_until=NULL,state=? WHERE id=?",(state,receipt_id))
+
+    def receipt_ack(self, receipt_id, peer_identity):
+        with self.transaction() as db:
+            row=db.execute("SELECT * FROM receipts WHERE id=?",(receipt_id,)).fetchone()
+            if not row or (row["peer_node"],row["peer_inc"])!=tuple(peer_identity):
+                return False
+            if row["state"]!="suppressed":
+                db.execute("UPDATE receipts SET state='received' WHERE id=?",(receipt_id,))
+            return True
+
+    def received_receipt(self, message, peer_identity):
+        with self.transaction() as db:
+            row=db.execute("SELECT * FROM outbox WHERE id=?",(message.get("delivery_id"),)).fetchone()
+            if not isinstance(message.get("payload"),dict) or not isinstance(message.get("id"),str) or not re.fullmatch(r"[0-9a-f]{64}",message["id"]):
+                return False
+            if not row or (row["peer_node"],row["peer_inc"],row["target_sid"])!=(peer_identity[0],peer_identity[1],message["payload"].get("target_sid")):
+                return False
+            kind=message.get("kind")
+            if kind=="peer_received":
+                db.execute("UPDATE outbox SET transport='peer_received',attempt_until=NULL WHERE id=?",(row["id"],))
+            elif kind=="native_handoff":
+                payload=message.get("payload",{})
+                binding=payload.get("target_generation")
+                if not isinstance(binding,dict) or type(binding.get("pid")) is not int or binding["pid"]<=0 or not isinstance(binding.get("procStart"),str) or not isinstance(binding.get("pidDomain"),str) or payload.get("native_state") not in ("socket_written_unconfirmed","handoff_unknown"):
+                    return False
+                db.execute("UPDATE outbox SET native_state=?,target_generation=? WHERE id=?",(payload["native_state"],canonical_json(binding),row["id"]))
+                updated=db.execute("SELECT * FROM outbox WHERE id=?",(row["id"],)).fetchone()
+                self._reconcile_native_status(db,updated)
+            elif kind=="receiver_acknowledged":
+                payload=message.get("payload",{});declared=payload.get("declared_at")
+                if type(declared) not in (int,float) or not math.isfinite(declared) or declared>self._clock(db)+load_config()["clock_skew"] or row["target_generation"]!=canonical_json(payload.get("target_generation")):
+                    return False
+                db.execute("UPDATE outbox SET acknowledged=1 WHERE id=?",(row["id"],))
+            else:
+                return False
+            return True
+
+    def _admission(self, db, row, state):
+        if row["admission"] in ("denied","refused","dropped","expired") or row["admission"]=="delivered" and state=="held":
+            return False
+        db.execute("UPDATE outbox SET admission=?,disposition=? WHERE id=?",(state,"terminal" if state in ("denied","refused","dropped","expired") else row["disposition"],row["id"]))
+        return True
+
+    def _reconcile_native_status(self, db, row):
+        pending=list(db.execute("SELECT * FROM native_status_pending WHERE delivery_id=? ORDER BY observed,id",(row["id"],)))
+        for fact in pending:
+            if (fact["peer_node"],fact["peer_inc"],fact["channel"],fact["source_sid"],fact["source_generation"],fact["target_sid"],fact["target_generation"],fact["native_id"]) == (row["peer_node"],row["peer_inc"],row["channel"],row["source_sid"],row["source_generation"],row["target_sid"],row["target_generation"],row["native_id"]):
+                current=db.execute("SELECT * FROM outbox WHERE id=?",(row["id"],)).fetchone()
+                self._admission(db,current,fact["status"])
+            db.execute("DELETE FROM native_status_pending WHERE id=?",(fact["id"],))
+
+    def native_status(self, peer_identity, sender_sid, target_sid, target_generation, frame, source_generation=None, ingress_channel=None):
+        if frame.get("type")!="control" or frame.get("action")!="peer_message_status":
+            return 0
+        state=frame.get("status")
+        if state=="expired" and frame.get("status_detail")=="refused":
+            state="refused"
+        if state not in ("held","denied","expired","delivered","refused","dropped"):
+            return 0
+        ids=[]
+        if safe_identifier(frame.get("orig_msg_id")):
+            ids.append(frame["orig_msg_id"])
+        if state=="dropped" and isinstance(frame.get("dropped_msg_ids"),list):
+            ids += [x for x in frame["dropped_msg_ids"][:100] if safe_identifier(x)]
+        changed=0
+        with self.transaction() as db:
+            for native_id in set(ids):
+                row=db.execute("SELECT * FROM outbox WHERE native_id=? AND source_sid=? AND target_sid=? AND peer_node=? AND peer_inc=?",
+                               (native_id,sender_sid,target_sid,peer_identity[0],peer_identity[1])).fetchone()
+                if not row or not ingress_channel or row["channel"]!=ingress_channel or source_generation is None or row["source_generation"]!=canonical_json(source_generation):
+                    continue
+                target_binding=canonical_json(target_generation)
+                if row["target_generation"] is None:
+                    if db.execute("SELECT COUNT(*) FROM native_status_pending WHERE delivery_id=?",(row["id"],)).fetchone()[0]>=64:
+                        continue
+                    identity={"delivery":row["id"],"peer":peer_identity,"channel":ingress_channel,"source":sender_sid,"source_generation":source_generation,
+                              "target":target_sid,"target_generation":target_generation,"native":native_id,"status":state}
+                    fact_id=hashlib.sha256(canonical_json(identity).encode()).hexdigest()
+                    if not db.execute("SELECT 1 FROM native_status_pending WHERE id=?",(fact_id,)).fetchone():
+                        self._budget(db,[],metadata_rows=1,control=True)
+                        db.execute("INSERT INTO native_status_pending VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",(fact_id,row["id"],peer_identity[0],peer_identity[1],ingress_channel,sender_sid,row["source_generation"],target_sid,target_binding,native_id,state,self._clock(db),row["retain_until"]))
+                        changed+=1
+                    continue
+                if row["target_generation"]!=target_binding:
+                    continue
+                if self._admission(db,row,state):
+                    changed+=1
+        return changed
+
+    def status(self, inbox_sid=None):
+        with self.connection() as db:
+            if inbox_sid is not None:
+                rows=db.execute("SELECT id,native_id,source_sid,target_sid,native_state,admission,acknowledged,disposition,expires FROM inbox WHERE target_sid=?",(inbox_sid,))
+            else:
+                rows=db.execute("SELECT id,native_id,target_peer,target_sid,transport,native_state,admission,acknowledged,disposition,attempts,expires FROM outbox")
+            return [dict(r) for r in rows]
+
+    def bind_local_outgoing(self, delivery_id):
+        with self.transaction() as db:
+            row=db.execute("SELECT * FROM outbox WHERE id=?",(delivery_id,)).fetchone()
+            if not row or row["target_peer"]!="@local":
+                raise ReliabilityError("not a local delivery")
+            if row["mode"] not in ("unbound","durable") or row["peer_node"] and (row["peer_node"],row["peer_inc"])!=(self.node_id,self.incarnation):
+                raise ReliabilityError("local reliability identity changed")
+            db.execute("UPDATE outbox SET mode='durable',peer_node=?,peer_inc=?,channel='local' WHERE id=?",(self.node_id,self.incarnation,delivery_id))
+            return dict(db.execute("SELECT * FROM outbox WHERE id=?",(delivery_id,)).fetchone())
+
+    def apply_local_receipts(self, explicit=False):
+        for row in self.receipt_rows("@local"):
+            if row["state"] in ("suppressed","expired","received"):
+                continue
+            with self.transaction() as db:
+                cfg,read,retry,revision=self._policy(db)
+                fresh=db.execute("SELECT * FROM receipts WHERE id=?",(row["id"],)).fetchone()
+                if fresh["kind"]=="receiver_acknowledged" and (not read or fresh["privacy_suppressed"]):
+                    db.execute("UPDATE receipts SET state='suppressed' WHERE id=?",(row["id"],));continue
+                if not retry and not explicit:
+                    continue
+            message={"id":row["id"],"delivery_id":row["delivery_id"],"kind":row["kind"],"payload":json.loads(row["payload"])}
+            if self.received_receipt(message,(self.node_id,self.incarnation)):
+                self.receipt_ack(row["id"],(self.node_id,self.incarnation))
+
+    def explicit_retry(self, delivery_id, owner_rec):
+        with self.transaction() as db:
+            now=self._clock(db);cfg,read,retry,revision=self._policy(db)
+            row=db.execute("SELECT * FROM outbox WHERE id=?",(delivery_id,)).fetchone()
+            if not row or row["source_sid"]!=(owner_rec or {}).get("sessionId","") or row["source_generation"]!=canonical_json(generation(owner_rec or {})):
+                raise ReliabilityError("retry requires the original owning session generation")
+            if row["transport"]!="queued" or row["mode"]=="legacy" and row["legacy_started"] or row["disposition"] in ("terminal","needs_reconcile") or row["admission"] in ("held","denied","refused","dropped","expired") or row["expires"]<=now or row["attempts"]>=cfg["max_attempts"]:
+                raise ReliabilityError("message is not safely retryable")
+            self._budget(db,[],metadata_rows=1)
+            token=str(uuid.uuid4())
+            db.execute("INSERT INTO explicit_grants(token,delivery_id,peer,owner_sid,owner_generation,purpose,created,expires) VALUES (?,?,?,?,?,?,?,?)",
+                       (token,delivery_id,row["target_peer"],row["source_sid"],row["source_generation"],"outgoing_retry",now,min(now+60,row["expires"])))
+            db.execute("UPDATE outbox SET next_at=?,attempt_until=NULL WHERE id=?",(now,delivery_id))
+            result=dict(db.execute("SELECT * FROM outbox WHERE id=?",(delivery_id,)).fetchone());result["explicit_grant"]=token
+            return result
+
+    def consume_explicit_grant(self, token, delivery_id, peer, owner_rec):
+        with self.transaction() as db:
+            now=self._clock(db);self._policy(db)
+            grant=db.execute("SELECT * FROM explicit_grants WHERE token=?",(token,)).fetchone()
+            if not grant or grant["used"] or grant["expires"]<=now or (grant["delivery_id"],grant["peer"],grant["owner_sid"],grant["owner_generation"],grant["purpose"])!=(delivery_id,peer,owner_rec.get("sessionId"),canonical_json(generation(owner_rec)),"outgoing_retry"):
+                return False
+            row=db.execute("SELECT * FROM outbox WHERE id=?",(delivery_id,)).fetchone()
+            if not row or row["transport"]!="queued" or row["disposition"] in ("terminal","needs_reconcile") or row["admission"] in ("held","denied","refused","dropped","expired"):
+                return False
+            db.execute("UPDATE explicit_grants SET used=1 WHERE token=? AND used=0",(token,))
+            return True
+
+    def gc(self):
+        with self.transaction() as db:
+            now=self._clock(db)
+            for table in ("outbox","inbox"):
+                db.execute("UPDATE "+table+" SET frame=NULL,payload_bytes=0 WHERE expires<=?",(now,))
+                db.execute("DELETE FROM "+table+" WHERE retain_until<?",(now,))
+            db.execute("DELETE FROM receipts WHERE retain_until<?",(now,))
+            db.execute("DELETE FROM native_status_pending WHERE retain_until<?",(now,))
+            db.execute("DELETE FROM explicit_grants WHERE expires<?",(now,))
+            self._gc_routes(db,now)
+        # auto_vacuum=NONE retains its high-water file after deletion. Reclaim only
+        # after GC committed; valid replay/dedup records are never deleted for space.
+        with self.connection() as db:
+            capacity=self._capacity(db,load_config())
+            if capacity["free"] and capacity["required_bytes"] > capacity["available_bytes"]:
+                db.execute("PRAGMA temp_store=MEMORY")
+                db.execute("VACUUM")
 
 
 # -------------------------------------------------------------------- audit
@@ -300,27 +1172,45 @@ def display_name(rec):
     return rec.get("name") or os.path.basename(rec.get("cwd") or "") or str(rec.get("pid"))
 
 
-def deliver_local(sock, pid, frame):
-    """Write one frame to a local inbox (real session or mirror), authenticated
-    with the owner's peerToken, exactly as Claude Code's own sender does."""
-    kp = read_json(key_path(pid, sock))
-    if not kp or "peerToken" not in kp:
-        return f"no messaging key for pid {pid}"
-    data = (json.dumps({"type": "auth", "token": kp["peerToken"]}) + "\n" +
-            json.dumps(frame, ensure_ascii=False) + "\n").encode()
-    if len(data) > MAX_FRAME:
-        return "message too large"
-    try:
-        c = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        c.settimeout(5)
-        c.connect(sock)
-        c.sendall(data)
-        time.sleep(0.15)
-        c.shutdown(socket.SHUT_WR)
-        c.close()
-        return None
-    except OSError as e:
-        return f"{type(e).__name__}: {e}"
+def deliver_local(sock, pid, frame, expected_sid=None, expected_generation=None, structured=False, prewrite_check=None):
+    """A successful socket write is not native admission, reading, or approval."""
+    result = {"state": "prewrite_failed", "error": "target_unavailable", "safe_to_retry": True}
+    target = next((r for r in read_sessions(include_mirrors=True) if r["pid"] == pid and r["messagingSocketPath"] == sock), None)
+    if target and (expected_sid is None or target.get("sessionId") == expected_sid) and (expected_generation is None or generation(target) == expected_generation):
+        kp = read_json(key_path(pid, sock))
+        if not kp or not isinstance(kp.get("peerToken"), str) or any(kp.get(k) != target.get(k) for k in ("procStart", "pidDomain")):
+            result["error"] = "key_generation_mismatch"
+        else:
+            c = None
+            io_started = False
+            try:
+                data = (json.dumps({"type": "auth", "token": kp["peerToken"]}) + "\n" +
+                        json.dumps(frame, ensure_ascii=False, allow_nan=False) + "\n").encode()
+                if len(data) > MAX_FRAME:
+                    result["error"] = "message_too_large"
+                else:
+                    c = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                    c.settimeout(5)
+                    c.connect(sock)
+                    current = next((r for r in read_sessions(include_mirrors=True) if r["pid"] == pid and r.get("sessionId") == target.get("sessionId") and generation(r) == generation(target)), None)
+                    if not current or prewrite_check is not None and not prewrite_check():
+                        result["error"] = "dispatch_fence_changed"
+                    else:
+                        # Once sendall starts, a timeout cannot certify zero native side effects.
+                        io_started = True
+                        c.sendall(data)
+                        time.sleep(0.15)
+                        c.shutdown(socket.SHUT_WR)
+                        result = {"state": "socket_written_unconfirmed", "error": None, "safe_to_retry": False}
+            except (OSError, ValueError, TypeError):
+                result = {"state": "handoff_unknown" if io_started else "prewrite_failed",
+                          "error": "native_write_uncertain" if io_started else "native_prewrite_failed", "safe_to_retry": not io_started}
+            finally:
+                if c is not None:
+                    c.close()
+    if structured:
+        return result
+    return None if result["state"] == "socket_written_unconfirmed" else result["error"]
 
 
 # ------------------------------------------------------------------- roster
@@ -519,6 +1409,7 @@ def cmd_mirror(a):
         "kind": "interactive", "entrypoint": "cli", "pidDomain": dom, "messagingSocketPath": sock,
         "name": a.name, "nameSource": "user", "nameSince": now, "agent": MIRROR_TAG,
         "ccmHost": a.peer, "ccmRemoteName": remote.get("name"), "ccmTask": task,
+        "ccmRemoteGeneration": generation(remote),
         "detail": f"[{a.peer}] {task}" if task else f"[{a.peer}] {remote.get('name')}",
         "status": remote.get("status") or "idle", "updatedAt": now, "statusUpdatedAt": now,
     }
@@ -576,8 +1467,18 @@ def cmd_mirror(a):
                 frame = json.loads(l)
             except ValueError:
                 continue
+            delivery_id = None
+            if frame.get("type") == "user" and safe_identifier(frame.get("msg_id")) and safe_identifier(remote.get("sessionId")):
+                try:
+                    address = frame.get("from")
+                    path = os.path.abspath(unquote(address[4:])) if isinstance(address, str) and address.startswith("uds:") else None
+                    source = next((r for r in read_sessions() if path and os.path.abspath(r["messagingSocketPath"]) == path), None)
+                    delivery_id = ReliabilityStore().enqueue([{"peer":a.peer,"sid":remote["sessionId"]}],frame,source)[0]["id"]
+                except (OSError, sqlite3.Error, ReliabilityError, ValueError):
+                    log("mirror: durable acceptance failed")
+                    continue
             with out_lock:
-                print(json.dumps({"frame": frame}, ensure_ascii=False), flush=True)
+                print(json.dumps({"frame": frame, "delivery_id": delivery_id}, ensure_ascii=False), flush=True)
 
     while True:
         c, _ = srv.accept()
@@ -589,8 +1490,14 @@ class Node:
     """One end of a link; both ends run the same logic: publish local sessions
     (with their registered task), mirror the peer's, relay frames both ways."""
 
-    def __init__(self, rfile, wfile, label, peer_label=None, is_server=False):
+    def __init__(self, rfile, wfile, label, peer_label=None, is_server=False, trusted_link=None):
         self.rfile, self.wfile = rfile, wfile
+        self.trusted_link = trusted_link
+        self.peer_identity = None
+        self.durable_peer = False
+        self.peer_advertised = False
+        self.remote_records = []
+        self._store = None
         self.label = label
         self.peer_label = peer_label
         self.is_server = is_server
@@ -603,19 +1510,183 @@ class Node:
         self.stop = threading.Event()
         self.session = {"relay_out": 0, "relay_in": 0, "errors": 0}
 
+    @property
+    def store(self):
+        if self._store is None:
+            self._store = ReliabilityStore()
+        return self._store
+
     def send(self, obj):
-        data = (json.dumps(obj, ensure_ascii=False) + "\n").encode()
+        data = (json.dumps(obj, ensure_ascii=False, allow_nan=False) + "\n").encode()
+        if len(data) > MAX_FRAME:
+            raise ReliabilityError("link envelope too large")
         with self.wlock:
             self.wfile.write(data)
             self.wfile.flush()
 
+    def remote_by_sid(self, sid):
+        rows = [r for r in self.remote_records if r.get("sessionId") == sid]
+        return rows[0] if len(rows) == 1 else None
+
+    def mirror_by_sid(self, sid):
+        rows = [m for m in list(self.mirrors.values()) if m["rec"].get("sessionId") == sid]
+        return rows[0] if len(rows) == 1 else None
+
+    def capture_outgoing(self, frame, remote):
+        source = self.local_by_sock(frame.get("from"))
+        if not source:
+            records = read_sessions()
+            path = unquote(frame.get("from", "uds:")[4:]) if isinstance(frame.get("from"), str) else ""
+            source = next((r for r in records if os.path.abspath(r["messagingSocketPath"]) == os.path.abspath(path)), None) if path else None
+        return self.store.enqueue([{"peer":self.peer_label,"sid":remote["sessionId"]}],frame,source)[0]
+
+    def send_outgoing(self, delivery_id, explicit=False):
+        if not self.peer_advertised:
+            return False
+        rows = [r for r in self.store.outbox_rows(self.peer_label) if r["id"] == delivery_id]
+        if not rows:
+            return False
+        row = rows[0]
+        if self.durable_peer:
+            mode = "durable"
+        else:
+            mode = "legacy"
+            target = self.remote_by_sid(row["target_sid"])
+            if not target:
+                return False
+        source = next((r for r in self.local.values() if r.get("sessionId") == row["source_sid"]),None)
+        if row["source_sid"] and not source:
+            return False
+        attempt = self.store.reserve_outgoing(delivery_id,self.trusted_link,self.peer_identity,mode,explicit=explicit)
+        if not attempt:
+            return False
+        outcome = "not_started"
+        try:
+            if not self.store.outgoing_send_allowed(attempt,explicit=explicit):
+                return False
+            outcome = "sent"
+            if mode == "durable":
+                self.send(self.store.outgoing_envelope(attempt))
+            else:
+                target = self.remote_by_sid(attempt["target_sid"])
+                self.send({"op":"deliver","to_pid":target["pid"],"from_pid":source and source["pid"],"frame":json.loads(attempt["frame"])})
+            self.bump("relay_out")
+        except (OSError, ValueError, ReliabilityError):
+            outcome = "uncertain"
+        finally:
+            self.store.outgoing_finished(delivery_id,attempt["attempt_owner"],outcome)
+            audit("relay_out",msg_id=attempt["native_id"],delivery_id=attempt["id"],peer=self.peer_label,
+                  relay_node=self.label,to=attempt["target_sid"],state="link_written_unconfirmed" if outcome=="sent" else outcome,
+                  ok=outcome=="sent",attempt=attempt["attempts"],preview=preview(frame_text(json.loads(attempt["frame"]))))
+        return outcome == "sent"
+
+    def send_receipt(self, row, explicit=False, reactive=False):
+        if not self.durable_peer or (row["peer_node"],row["peer_inc"]) != self.peer_identity:
+            return False
+        receipt = self.store.reserve_receipt(row["id"],explicit=explicit,reactive=reactive)
+        if not receipt:
+            return False
+        if not self.store.receipt_send_allowed(receipt):
+            return False
+        try:
+            self.send({"op":"receipt","id":receipt["id"],"delivery_id":receipt["delivery_id"],"kind":receipt["kind"],
+                       "node_id":self.store.node_id,"incarnation":self.store.incarnation,"payload":json.loads(receipt["payload"])})
+            return True
+        except (OSError, ValueError, ReliabilityError):
+            return False
+        finally:
+            self.store.receipt_finished(receipt["id"],receipt["owner"])
+
+    def dispatch_inbox(self, item, explicit=False, local=False):
+        key=(item["origin_node"],item["origin_inc"],item["id"])
+        targets=[r for r in read_sessions() if r.get("sessionId")==item["target_sid"]]
+        if len(targets)!=1:
+            self.store.waiting(key,"waiting_target")
+            return False
+        target=targets[0]
+        frame=json.loads(item["frame"]) if item["frame"] else None
+        if not frame:
+            return False
+        if item["source_sid"]:
+            if local:
+                sources=[r for r in read_sessions() if r.get("sessionId")==item["source_sid"]]
+                sender={"sock":sources[0]["messagingSocketPath"],"name":display_name(sources[0])} if len(sources)==1 else None
+            else:
+                sender=self.mirror_by_sid(item["source_sid"])
+            if not sender:
+                self.store.waiting(key,"waiting_source_route")
+                return False
+            frame=rewrite_from(frame,sender["sock"],sender["name"])
+        claim=self.store.claim_native(key,target,explicit=explicit)
+        if not claim:
+            return False
+        result=deliver_local(target["messagingSocketPath"],target["pid"],frame,expected_sid=item["target_sid"],
+                             expected_generation=generation(target),structured=True,
+                             prewrite_check=lambda:self.store.prewrite_allowed(key,claim["dispatch_owner"]))
+        # IO test substitutes model only the transport, never production dispatch logic.
+        if result is None:
+            result={"state":"socket_written_unconfirmed","error":None,"safe_to_retry":False}
+        if result["state"] in ("socket_written_unconfirmed","handoff_unknown"):
+            self.bump("native_handoffs")
+        audit("native_handoff" if result["state"]!="prewrite_failed" else "native_prewrite_failed",
+              msg_id=item["native_id"],delivery_id=item["id"],peer=self.peer_label,relay_node=self.label,
+              to=item["target_sid"],state=result["state"],ok=result["state"]=="socket_written_unconfirmed")
+        try:
+            self.store.native_finished(key,claim["dispatch_owner"],result)
+        except (sqlite3.Error,OSError,ReliabilityError):
+            # native_dispatching remains irreclaimable if the post-write commit fails.
+            return False
+        if self.durable_peer and explicit and result["state"] in ("socket_written_unconfirmed","handoff_unknown"):
+            receipt=next((r for r in self.store.receipt_rows(self.peer_label) if r["delivery_id"]==item["id"] and r["kind"]=="native_handoff"),None)
+            if receipt and self.store.claim_explicit_notice("receipts",receipt["id"]):
+                self.send_receipt(receipt,explicit=True)
+        return result["state"]=="socket_written_unconfirmed"
+
+    def on_reliable_deliver(self, msg):
+        if not self.durable_peer or not self.peer_identity:
+            return
+        row,created=self.store.accept(msg,self.peer_label,self.trusted_link,self.peer_identity)
+        self.bump("relay_in" if created else "relay_duplicates")
+        audit("relay_in",msg_id=row["native_id"],delivery_id=row["id"],peer=self.peer_label,relay_node=self.label,
+              to=row["target_sid"],state="durable_accepted" if created else "deduplicated",ok=True,
+              preview=preview(frame_text(msg["frame"])))
+        # Acceptance and its dedup/receipt record have committed before this response.
+        receipt=next(r for r in self.store.receipt_rows(self.peer_label) if r["delivery_id"]==row["id"] and r["kind"]=="peer_received")
+        if created:
+            self.send_receipt(receipt,explicit=True)
+        else:
+            # Reactive transport ACKs use the same persistent attempt budget/lease,
+            # not a new explicit grant or an unmetered send bypass.
+            self.send_receipt(receipt,reactive=True)
+        if created:
+            self.dispatch_inbox(row,explicit=True)
+
+    def on_receipt(self, msg):
+        if not self.durable_peer or (msg.get("node_id"),msg.get("incarnation"))!=self.peer_identity:
+            return
+        if self.store.received_receipt(msg,self.peer_identity):
+            self.send({"op":"receipt_ack","id":msg.get("id"),"node_id":self.store.node_id,"incarnation":self.store.incarnation})
+
+    def pump(self):
+        self.store.recover_dispatches()
+        for row in self.store.outbox_rows(self.peer_label):
+            self.send_outgoing(row["id"])
+        for row in self.store.inbox_rows():
+            if row["peer"]==self.peer_label and row["channel"]==self.trusted_link:
+                self.dispatch_inbox(row)
+        for row in self.store.receipt_rows(self.peer_label):
+            self.send_receipt(row)
+        self.store.gc()
+
     def bump(self, key):
-        self.session[key] += 1
+        self.session[key] = self.session.get(key,0) + 1
         COUNTERS.bump(self.peer_label or "?", key)
 
     def scan(self):
         with self.scanlock:
             self.publish_sessions()
+        if self.peer_advertised:
+            self.pump()
 
     def publish_sessions(self):
         recs = {r["pid"]: r for r in read_sessions()}
@@ -626,7 +1697,7 @@ class Node:
             if r.get("kind") not in ("interactive", "bg", None):
                 continue
             item = {k: r.get(k) for k in ("pid", "sessionId", "name", "cwd", "status", "peerProtocol",
-                                          "peerFeatures", "version", "kind")}
+                                          "peerFeatures", "version", "kind", "procStart", "pidDomain")}
             item["task"] = redact((roster_get(r.get("sessionId")) or {}).get("task")) or infer_task(r)
             pub.append(item)
         if pub != self.last_pub:
@@ -639,11 +1710,13 @@ class Node:
         return f"{self.peer_label}-{base}"[:64]
 
     def sync_mirrors(self, remote_list):
+        self.remote_records = list(remote_list)
+        self.store.remember_routes(self.peer_label, remote_list)
         want = {r["pid"]: r for r in remote_list}
         with self.mlock:
             for pid in list(self.mirrors):
                 m = self.mirrors[pid]
-                if pid not in want or m["proc"].poll() is not None or want[pid].get("name") != m["rec"].get("name"):
+                if pid not in want or m["proc"].poll() is not None or any(want[pid].get(k) != m["rec"].get(k) for k in ("name", "sessionId", "procStart", "pidDomain")):
                     self.kill_mirror(pid)
             for pid, rec in want.items():
                 if pid not in self.mirrors:
@@ -693,12 +1766,48 @@ class Node:
     def mirror_reader(self, rpid, proc):
         for line in proc.stdout:
             try:
-                frame = json.loads(line)["frame"]
+                packet = json.loads(line)
+                frame = packet["frame"]
             except (ValueError, KeyError):
                 continue
             m = self.mirrors.get(rpid) or {}
             text = frame_text(frame)
-            # Publish a just-started sender before its first frame, not on the next timer tick.
+            if frame.get("type")=="ccm_local":
+                source=self.local_by_sock(frame.get("from")) or next((r for r in read_sessions() if frame.get("from")==peer_address(r["messagingSocketPath"])),None)
+                if source:
+                    if frame.get("action")=="outgoing_retry":
+                        with self.scanlock:
+                            self.publish_sessions()
+                        if self.store.consume_explicit_grant(frame.get("grant"),frame.get("id"),self.peer_label,source):
+                            self.send_outgoing(frame["id"],explicit=True)
+                    elif frame.get("action")=="receipt":
+                        for receipt in self.store.receipt_rows(self.peer_label):
+                            if receipt["id"]==frame.get("id"):
+                                item=next((r for r in self.store.inbox_rows() if r["id"]==receipt["delivery_id"] and r["target_sid"]==source["sessionId"]),None)
+                                if item and self.store.claim_explicit_notice("receipts",receipt["id"]):
+                                    if receipt["kind"]=="receiver_acknowledged":
+                                        dependency=next((r for r in self.store.receipt_rows(self.peer_label) if r["delivery_id"]==item["id"] and r["kind"]=="native_handoff"),None)
+                                        if dependency:
+                                            self.send_receipt(dependency,explicit=True)
+                                    self.send_receipt(receipt,explicit=True)
+                    elif frame.get("action")=="inbox":
+                        for item in self.store.inbox_rows():
+                            if item["id"]==frame.get("id") and item["target_sid"]==source["sessionId"] and item["peer"]==self.peer_label:
+                                self.dispatch_inbox(item,explicit=True)
+                continue
+            tracked = frame.get("type") == "user" and safe_identifier(frame.get("msg_id")) and safe_identifier((m.get("rec") or {}).get("sessionId"))
+            if tracked:
+                try:
+                    row = self.capture_outgoing(frame,m["rec"])
+                    first_notice = self.store.claim_explicit_notice("outbox",row["id"])
+                    # The outbox commits even if this one explicit opportunity is lost.
+                    with self.scanlock:
+                        self.publish_sessions()
+                    self.send_outgoing(row["id"],explicit=first_notice)
+                except (OSError, sqlite3.Error, ValueError, ReliabilityError):
+                    log("message remains queued or requires reconciliation")
+                continue
+            # Unknown native controls and untracked legacy frames retain their old path.
             with self.scanlock:
                 self.publish_sessions()
                 src = self.local_by_sock(frame.get("from"))
@@ -721,9 +1830,23 @@ class Node:
         frame = msg["frame"]
         target = {r["pid"]: r for r in read_sessions()}.get(msg["to_pid"])
         sender = self.mirrors.get(msg.get("from_pid"))
-        if sender:
-            frame = rewrite_from(frame, sender["sock"], sender["name"])
-        err = "target session gone" if not target else deliver_local(target["messagingSocketPath"], target["pid"], frame)
+        tracked = frame.get("type") == "user" and safe_identifier(frame.get("msg_id"))
+        err = "target session gone" if not target else None
+        if frame.get("type")=="ccm_local":
+            return
+        if tracked and target:
+            origin = self.peer_identity or ("legacy:" + (self.trusted_link or self.peer_label or "local"), "legacy")
+            envelope = {"frame":frame,"target_sid":target["sessionId"],"source_sid":(sender or {}).get("rec",{}).get("sessionId") or "",
+                        "source_generation":generation((sender or {}).get("rec",{}))}
+            row,created = self.store.accept(envelope,self.peer_label,self.trusted_link,origin,legacy=True)
+            if created:
+                self.dispatch_inbox(row,explicit=True)
+        elif target:
+            if self.durable_peer and sender:
+                self.store.native_status(self.peer_identity,target.get("sessionId"),sender["rec"].get("sessionId"),generation(sender["rec"]),frame,source_generation=generation(target),ingress_channel=self.trusted_link)
+            if sender:
+                frame = rewrite_from(frame, sender["sock"], sender["name"])
+            err = deliver_local(target["messagingSocketPath"], target["pid"], frame)
         self.bump("relay_in")
         if err:
             self.bump("errors")
@@ -735,7 +1858,9 @@ class Node:
         self.send({"op": "ack", "id": frame.get("msg_id"), "error": err})
 
     def run(self):
-        self.send({"op": "hello", "label": self.label, "version": VERSION, "proto": PROTO})
+        self.send({"op": "hello", "label": self.label, "version": VERSION, "proto": PROTO,
+                   "reliability": {"schema": RELIABILITY_SCHEMA, "node_id": self.store.node_id,
+                                   "incarnation": self.store.incarnation}})
 
         def scanner():
             while not self.stop.is_set():
@@ -754,7 +1879,22 @@ class Node:
                     continue
                 op = msg.get("op")
                 if op == "hello":
-                    self.peer_label = self.peer_label or label_ok(msg.get("label"))
+                    claimed_label = label_ok(msg.get("label"))
+                    if self.peer_label and self.peer_label != claimed_label:
+                        raise ReliabilityError("paired peer label changed")
+                    if self.is_server and self.peer_label is None and self.trusted_link:
+                        self.trusted_link += ":" + claimed_label
+                    self.peer_label = self.peer_label or claimed_label
+                    self.peer_advertised = True
+                    capability = msg.get("reliability")
+                    if self.trusted_link and isinstance(capability, dict) and type(capability.get("schema")) is int and capability["schema"] == RELIABILITY_SCHEMA:
+                        identity = (capability.get("node_id"),capability.get("incarnation"))
+                        if self.store.bind_peer(self.trusted_link,self.peer_label,*identity):
+                            self.peer_identity = identity
+                            self.durable_peer = True
+                        else:
+                            self.peer_advertised = False
+                            log("paired reliability identity changed; old queues paused")
                     if msg.get("version") != VERSION:
                         log(f"peer runs {msg.get('version')}, we run {VERSION}")
                     if self.is_server and self.peer_label in {p["label"] for p in load_config()["peers"]} and daemon_pid():
@@ -767,6 +1907,15 @@ class Node:
                     self.sync_mirrors(msg.get("list") or [])
                 elif op == "deliver":
                     threading.Thread(target=self.on_deliver, args=(msg,), daemon=True).start()
+                elif op == "reliable_deliver":
+                    try:
+                        self.on_reliable_deliver(msg)
+                    except (ReliabilityError, sqlite3.Error, OSError, ValueError):
+                        log("reliable delivery rejected or paused")
+                elif op == "receipt":
+                    self.on_receipt(msg)
+                elif op == "receipt_ack" and self.peer_identity and (msg.get("node_id"),msg.get("incarnation")) == self.peer_identity:
+                    self.store.receipt_ack(msg.get("id"),self.peer_identity)
                 elif op == "ack" and msg.get("error"):
                     log("remote delivery error:", msg)
                 elif op == "error":
@@ -815,6 +1964,27 @@ def rewrite_from(frame, sock, name):
     return frame
 
 
+def local_recovery(store=None, delivery_id=None, explicit=False):
+    store = store or ReliabilityStore()
+    node = Node(None,None,load_config()["label"],"@local",trusted_link="local")
+    node._store = store
+    store.recover_dispatches()
+    for row in store.outbox_rows("@local"):
+        if delivery_id and row["id"] != delivery_id or not row["frame"] or row["transport"] == "peer_received":
+            continue
+        try:
+            bound=store.bind_local_outgoing(row["id"])
+            item,created=store.accept(store.outgoing_envelope(bound),"@local","local",(store.node_id,store.incarnation))
+            store.peer_received(row["id"],(store.node_id,store.incarnation),row["target_sid"])
+        except (ReliabilityError,sqlite3.Error,OSError):
+            continue
+    for item in store.inbox_rows():
+        if item["peer"] == "@local" and (not delivery_id or item["id"]==delivery_id):
+            node.dispatch_inbox(item,explicit=explicit,local=True)
+    store.apply_local_receipts(explicit=explicit)
+    store.gc()
+
+
 # ------------------------------------------------------------------ links
 def cmd_serve(a):
     global LOG_TAG
@@ -825,7 +1995,9 @@ def cmd_serve(a):
             cfg["label"] = LOG_TAG
             save_config(cfg)
     try:
-        Node(sys.stdin.buffer, sys.stdout.buffer, LOG_TAG, is_server=True).run()
+        # The label is descriptive; the existing SSH/OS-account channel is the boundary.
+        channel = "incoming-ssh:" + LOG_TAG if os.environ.get("SSH_CONNECTION") else None
+        Node(sys.stdin.buffer, sys.stdout.buffer, LOG_TAG, is_server=True, trusted_link=channel).run()
     finally:
         COUNTERS.flush()
 
@@ -844,7 +2016,7 @@ def run_link(host, label, peer_label, links):
     cmd = ["ssh", "-T", "-o", "BatchMode=yes", "-o", "ServerAliveInterval=15", "-o", "ServerAliveCountMax=3",
            host, f"python3 {REMOTE_SCRIPT} serve --label {peer_label}"]
     proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE)
-    node = Node(proc.stdout, proc.stdin, label, peer_label)
+    node = Node(proc.stdout, proc.stdin, label, peer_label, trusted_link="configured-ssh:" + host)
     links[host] = node
     try:
         node.run()
@@ -874,6 +2046,7 @@ def daemon_main(peers, label):
     open(PIDFILE, "w").write(str(os.getpid()))
     links = {}
     started = int(time.time())
+    store = ReliabilityStore()
 
     def keep(peer):
         backoff = 1
@@ -909,6 +2082,10 @@ def daemon_main(peers, label):
     for p in peers:
         threading.Thread(target=keep, args=(p,), daemon=True).start()
     while True:
+        try:
+            local_recovery(store)
+        except (ReliabilityError,sqlite3.Error,OSError):
+            log("local queue recovery paused")
         COUNTERS.flush()
         snap = {"pid": os.getpid(), "version": VERSION, "label": label, "started": started,
                 "updated": int(time.time()), "links": {
@@ -923,8 +2100,6 @@ def daemon_main(peers, label):
 def cmd_up(a):
     cfg = load_config()
     hosts = a.hosts or [p["host"] for p in cfg["peers"]]
-    if not hosts:
-        sys.exit("no peers configured: run `ccm pair HOST` first")
     peers = [next((p for p in cfg["peers"] if p["host"] == h), {"host": h, "label": label_ok(h)}) for h in hosts]
     if daemon_pid():
         print(f"already running (pid {daemon_pid()})")
@@ -969,7 +2144,7 @@ def cmd_restart(a):
 
 
 def ensure_daemon():
-    if load_config()["peers"] and not daemon_pid():
+    if not daemon_pid():
         subprocess.Popen([sys.executable, os.path.abspath(__file__), "up"], stdin=subprocess.DEVNULL,
                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
 
@@ -1054,8 +2229,10 @@ def build_frame(me, text):
 def resolve(target, members):
     t = target.lower()
     exact = [m for m in members if (m.get("name") or "").lower() == t]
-    if exact:
+    if len(exact) == 1:
         return exact[0]
+    if len(exact) > 1:
+        sys.exit(f"ambiguous exact member '{target}'; select a unique SID")
     pref = [m for m in members if (m.get("name") or "").lower().startswith(t)]
     if len(pref) == 1:
         return pref[0]
@@ -1071,16 +2248,52 @@ def read_text(a):
     return text
 
 
+def resolve_delivery(target, members, store):
+    # Offline routing is permitted only for a previously observed, unique stable SID.
+    if isinstance(target,str) and target.startswith("sid:"):
+        sid=target[4:]
+        live=[r for r in members if r.get("sessionId")==sid]
+        cached=[r for r in store.cached_routes() if r["sid"]==sid]
+        peers={r.get("ccmHost") if is_mirror(r) else "@local" for r in live} | {r["peer"] for r in cached}
+        if len(peers)!=1 or len(live)>1:
+            sys.exit("SID is unknown or ambiguous")
+        return live[0] if live else {"sessionId":sid,"name":cached[0]["name"],"agent":MIRROR_TAG,"ccmHost":cached[0]["peer"]}
+    if any((r.get("name") or "").lower()==target.lower() for r in members):
+        return resolve(target,members)
+    cached=[r for r in store.cached_routes() if r["name"].lower()==target.lower() or (r["peer"]+"-"+r["name"]).lower()==target.lower()]
+    if len(cached)==1:
+        r=cached[0]
+        return {"sessionId":r["sid"],"name":target,"agent":MIRROR_TAG,"ccmHost":r["peer"]}
+    return resolve(target,members)
+
+
+def attempt_delivery(store,row,target,explicit=True):
+    if row["target_peer"]=="@local":
+        local_recovery(store,row["id"],explicit=explicit)
+        return
+    if not target.get("messagingSocketPath"):
+        return
+    # Wake an existing mirror; the durable queue, not this wakeup, owns the frame.
+    deliver_local(target["messagingSocketPath"],target["pid"],json.loads(row["frame"]))
+
+
 def cmd_send(a):
     me = whoami()
     members = [r for r in read_sessions(include_mirrors=True) if not me or r["pid"] != me["pid"]]
-    target = resolve(a.to, members)
-    frame, sender = build_frame(me, read_text(a))
-    err = deliver_local(target["messagingSocketPath"], target["pid"], frame)
-    audit("send", msg_id=frame["msg_id"], sender=sender, to=display_name(target), via="ccm",
-          ok=not err, error=err, preview=preview(frame_text(frame)))
-    print(f"→ {display_name(target)}: {'ok' if not err else err}")
-    sys.exit(1 if err else 0)
+    store=ReliabilityStore()
+    target = resolve_delivery(a.to,members,store)
+    frame,sender=build_frame(me,read_text(a))
+    row=store.enqueue([{"peer":target.get("ccmHost") if is_mirror(target) else "@local","sid":target["sessionId"]}],frame,me)[0]
+    try:
+        if row["target_peer"]=="@local":
+            store.claim_explicit_notice("outbox",row["id"])
+        attempt_delivery(store,row,target)
+    except (ReliabilityError,sqlite3.Error,OSError):
+        pass
+    audit("send",msg_id=frame["msg_id"],delivery_id=row["id"],sender=sender,to=display_name(target),via="ccm",ok=True,
+          state="durable_queued",preview=preview(frame_text(frame)))
+    print(f"→ {display_name(target)}: queued id={row['id']} (not proof of reading)")
+    sys.exit(0)
 
 
 def cmd_broadcast(a):
@@ -1096,16 +2309,95 @@ def cmd_broadcast(a):
     if not members:
         sys.exit("nobody to broadcast to")
     text = read_text(a)
-    frame, sender = build_frame(me, f"[broadcast to {len(members)} members] {text}")
-    results = {}
-    for r in members:
-        f = dict(frame, msg_id=str(uuid.uuid4()))
-        results[display_name(r)] = deliver_local(r["messagingSocketPath"], r["pid"], f) or "ok"
-    audit("broadcast", msg_id=frame["msg_id"], sender=sender, to=sorted(results), results=results,
-          preview=preview(frame_text(frame)))
-    for n, res in sorted(results.items()):
-        print(f"→ {n}: {res}")
-    sys.exit(0 if all(v == "ok" for v in results.values()) else 1)
+    frame,sender=build_frame(me,f"[broadcast to {len(members)} members] {text}")
+    if len({(r.get("ccmHost") if is_mirror(r) else "@local",r.get("sessionId")) for r in members})!=len(members):
+        sys.exit("broadcast target identities are ambiguous")
+    store=ReliabilityStore();group=str(uuid.uuid4())
+    batch=[({"peer":r.get("ccmHost") if is_mirror(r) else "@local","sid":r["sessionId"]},dict(frame,msg_id=str(uuid.uuid4()))) for r in members]
+    rows=store.enqueue_batch(batch,me,group_id=group)
+    results={}
+    for target,row in zip(members,rows):
+        try:
+            if row["target_peer"]=="@local":
+                store.claim_explicit_notice("outbox",row["id"])
+            attempt_delivery(store,row,target)
+        except (ReliabilityError,sqlite3.Error,OSError):
+            pass
+        results[display_name(target)]={"state":"queued","delivery_id":row["id"],"native_msg_id":row["native_id"]}
+    audit("broadcast",msg_id=frame["msg_id"],group_id=group,sender=sender,to=sorted(results),results=results,preview=preview(frame_text(frame)))
+    for name,result in sorted(results.items()):
+        print(f"→ {name}: queued id={result['delivery_id']}")
+    sys.exit(0)
+
+
+def wake_receipt_or_inbox(store, item, action, item_id, me):
+    if item["peer"]=="@local":
+        if action=="receipt":
+            store.apply_local_receipts(explicit=True)
+        else:
+            node=Node(None,None,load_config()["label"],"@local",trusted_link="local");node._store=store
+            node.dispatch_inbox(item,explicit=True,local=True);store.apply_local_receipts(explicit=True)
+        return
+    candidates=[r for r in read_sessions(include_mirrors=True) if is_mirror(r) and r.get("ccmHost")==item["peer"]]
+    if not candidates:
+        return
+    frame={"type":"ccm_local","action":action,"id":item_id,"from":peer_address(me["messagingSocketPath"])}
+    deliver_local(candidates[0]["messagingSocketPath"],candidates[0]["pid"],frame)
+
+
+def cmd_receipts(a):
+    store=ReliabilityStore()
+    me=whoami() if a.inbox else None
+    if a.inbox and not me:
+        sys.exit("inbox receipts require the owning Claude session")
+    rows=store.status(me["sessionId"] if me else None)
+    for row in rows:
+        row["receiver_acknowledged"]=bool(row.pop("acknowledged"))
+        row["human_read"]="unknown";row["human_approval"]="unknown"
+    if a.json:
+        print(json.dumps(rows,ensure_ascii=False,indent=2))
+    else:
+        for row in rows:
+            print(row["id"],row.get("target_peer") or "inbox",row["target_sid"],row.get("transport") or row.get("native_state"),
+                  "receiver_acknowledged="+str(row["receiver_acknowledged"]).lower(),row["disposition"])
+
+
+def cmd_read_ack(a):
+    me=whoami()
+    if not me:
+        sys.exit("read-ack requires the actual owning Claude ancestor")
+    store=ReliabilityStore();changed=store.acknowledge(a.id,me)
+    if changed:
+        item=next(r for r in store.inbox_rows() if r["id"]==a.id and r["target_sid"]==me["sessionId"])
+        receipt=next((r for r in store.receipt_rows(item["peer"]) if r["delivery_id"]==a.id and r["kind"]=="receiver_acknowledged"),None)
+        if receipt:
+            wake_receipt_or_inbox(store,item,"receipt",receipt["id"],me)
+    print(json.dumps({"delivery_id":a.id,"receiver_acknowledged":True,"human_read":"unknown","human_approval":"unknown"}))
+
+
+def cmd_retry(a):
+    me=whoami();store=ReliabilityStore()
+    if a.inbox:
+        if not me:
+            sys.exit("inbox retry requires the owning Claude ancestor")
+        items=[r for r in store.inbox_rows() if r["id"]==a.id and r["target_sid"]==me["sessionId"]]
+        if len(items)!=1 or items[0]["native_state"] not in ("waiting_target","waiting_source_route","prewrite_failed") or items[0]["admission"] in ("held","denied","refused","expired","dropped"):
+            sys.exit("native handoff is not safely retryable")
+        wake_receipt_or_inbox(store,items[0],"inbox",a.id,me)
+    else:
+        row=store.explicit_retry(a.id,me)
+        members=read_sessions(include_mirrors=True)
+        targets=[r for r in members if r.get("sessionId")==row["target_sid"] and (r.get("ccmHost") if is_mirror(r) else "@local")==row["target_peer"]]
+        if len(targets)==1:
+            if row["target_peer"]=="@local":
+                if store.consume_explicit_grant(row["explicit_grant"],row["id"],"@local",me or {}):
+                    attempt_delivery(store,row,targets[0])
+            else:
+                wake={"type":"ccm_local","action":"outgoing_retry","id":row["id"],"grant":row["explicit_grant"]}
+                if me:
+                    wake["from"]=peer_address(me["messagingSocketPath"])
+                deliver_local(targets[0]["messagingSocketPath"],targets[0]["pid"],wake)
+    print(json.dumps({"delivery_id":a.id,"state":"explicit_safe_retry_requested","reading":"unconfirmed"}))
 
 
 def cmd_task(a):
@@ -1360,7 +2652,10 @@ def cmd_pair(a):
     if any(p.get("label") == cfg["label"] for p in rcfg.get("peers", [])):
         sys.exit(f"✗ {host} already dials this machine ({cfg['label']}); a pair needs exactly one dialler. "
                  f"Run `ccm unpair <this-host>` there, or keep that direction.")
-    tar = subprocess.Popen(["tar", "czf", "-", "--exclude", ".git", "--exclude", "__pycache__", "-C", PLUGIN_ROOT, "."],
+    tar = subprocess.Popen(["tar", "czf", "-", "--exclude", ".git", "--exclude", "__pycache__",
+                            "--exclude", "reliability.sqlite3*", "--exclude", "reliability-identity.json",
+                            "--exclude", "reliability.lock", "--exclude", ".ccm-state", "--exclude", ".test-tmp",
+                            "-C", PLUGIN_ROOT, "."],
                            stdout=subprocess.PIPE)
     r = subprocess.run(["ssh", "-o", "BatchMode=yes", host,
                         f"rm -rf {REMOTE_HOME}.new && mkdir -p {REMOTE_HOME}.new && tar xzf - -C {REMOTE_HOME}.new && "
@@ -1465,9 +2760,394 @@ def cmd_config(a):
         cfg["label"] = label_ok(a.value)
     elif a.action == "set-preview":
         cfg["audit_preview_chars"] = int(a.value)
+    elif a.action in ("set-read-receipts","set-retry"):
+        value=json.loads(a.value)
+        if type(value) is not bool:
+            raise ReliabilityError("use the JSON boolean true or false")
+        cfg["read_receipts" if a.action=="set-read-receipts" else "retry_enabled"]=value
+    elif a.action == "set-reliability":
+        values=json.loads(a.value)
+        if not isinstance(values,dict) or any(k not in RELIABILITY_DEFAULTS for k in values):
+            raise ReliabilityError("set-reliability accepts only known reliability settings")
+        cfg.update(values)
     if a.action != "show":
-        save_config(cfg)
+        cfg=save_config(cfg)
     print(json.dumps(cfg, indent=2, ensure_ascii=False))
+
+
+# --------------------------------------------------------------------- agent bridge
+AGENTS_DIR = os.path.join(STATE_DIR, "agents")
+
+
+def cmd_agent(a):
+    if a.action == "serve":
+        cmd_agent_serve(a)
+    elif a.action == "wait":
+        cmd_agent_wait(a)
+    elif a.action == "status":
+        cmd_agent_status(a)
+    elif a.action == "stop":
+        cmd_agent_stop(a)
+
+
+def cmd_agent_serve(a):
+    name = label_ok(a.name)
+    os.makedirs(AGENTS_DIR, mode=0o700, exist_ok=True)
+    pid_file = os.path.join(AGENTS_DIR, f"{name}.pid")
+    if os.path.exists(pid_file):
+        old_pid = read_json(pid_file, {}).get("pid")
+        if old_pid and pid_alive(old_pid):
+            sys.exit(f"agent bridge '{name}' is already running (PID {old_pid})")
+        else:
+            try:
+                os.unlink(pid_file)
+            except OSError:
+                pass
+
+    if getattr(a, "daemon", False):
+        child = os.fork()
+        if child > 0:
+            print(json.dumps({"daemon": True, "agent": name, "pid": child}))
+            sys.exit(0)
+        os.setsid()
+        devnull = open(os.devnull, "r+")
+        os.dup2(devnull.fileno(), 0)
+        log_path = os.path.join(AGENTS_DIR, f"{name}.log")
+        log_fd = os.open(log_path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+        os.dup2(log_fd, 1)
+        os.dup2(log_fd, 2)
+
+    pid = os.getpid()
+    write_json_private(pid_file, {"name": name, "pid": pid, "startedAt": now_ms()})
+
+    sdir = socket_dir()
+    os.makedirs(sdir, mode=0o700, exist_ok=True)
+    sock = os.path.join(sdir, f"{pid}.sock")
+    token = secrets.token_hex(16)
+    ps = proc_start(pid)
+    dom = pid_domain()
+    reg_path = os.path.join(SESSIONS_DIR, f"{pid}.json")
+    kpath = key_path(pid, sock)
+
+    srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        os.unlink(sock)
+    except OSError:
+        pass
+    srv.bind(sock)
+    os.chmod(sock, 0o600)
+    srv.listen(16)
+
+    sid = f"agent-{name}-{pid}"
+    kind = getattr(a, "kind", "generic") or "generic"
+    task = getattr(a, "task", None) or f"Agent bridge for {kind}"
+
+    def cleanup(*_):
+        for p in (reg_path, kpath, sock, pid_file):
+            try:
+                os.unlink(p)
+            except OSError:
+                pass
+        roster_drop(sid)
+        audit("agent_offline", agent=name, kind=kind, pid=pid)
+        os._exit(0)
+
+    try:
+        signal.signal(signal.SIGTERM, cleanup)
+        signal.signal(signal.SIGINT, cleanup)
+    except ValueError:
+        pass
+
+    write_json_private(kpath, {"peerToken": token, "procStart": ps, "pidDomain": dom})
+    now = now_ms()
+    reg = {
+        "pid": pid, "sessionId": sid, "cwd": os.getcwd(),
+        "startedAt": now, "procStart": ps, "version": f"ccm-agent-{VERSION}",
+        "peerProtocol": 1, "peerFeatures": ["agent_bridge"],
+        "kind": "interactive", "entrypoint": "cli", "pidDomain": dom,
+        "messagingSocketPath": sock, "name": name, "nameSource": "user",
+        "nameSince": now, "agent": f"ccm-agent-{kind}",
+        "status": "idle", "updatedAt": now, "statusUpdatedAt": now,
+        "ccmTask": task, "detail": f"[{kind}] {task}",
+    }
+    write_json_private(reg_path, reg)
+    roster_put(sid, pid=pid, name=name, cwd=os.getcwd(), task=task)
+    audit("agent_online", agent=name, kind=kind, pid=pid)
+
+    ready_payload = {"ready": True, "agent": name, "pid": pid, "sock": sock}
+    if not getattr(a, "daemon", False):
+        print(json.dumps(ready_payload), flush=True)
+
+    if getattr(a, "timeout", 0) and a.timeout > 0:
+        def timeout_handler():
+            time.sleep(a.timeout)
+            cleanup()
+        threading.Thread(target=timeout_handler, daemon=True).start()
+
+    def handle(c):
+        buf = b""
+        c.settimeout(3)
+        try:
+            while len(buf) <= MAX_FRAME + 4096:
+                d = c.recv(65536)
+                if not d:
+                    break
+                buf += d
+        except OSError:
+            pass
+        finally:
+            c.close()
+
+        lines = [l for l in buf.split(b"\n") if l.strip()]
+        if not lines:
+            return
+        try:
+            first = json.loads(lines[0])
+        except ValueError:
+            return
+        if first.get("type") != "auth" or not secrets.compare_digest(str(first.get("token", "")), token):
+            log(f"agent {name}: unauthenticated frame dropped")
+            return
+
+        for l in lines[1:]:
+            try:
+                frame = json.loads(l)
+            except ValueError:
+                continue
+
+            text = frame_text(frame)
+            from_addr = frame.get("from")
+            from_name = header_attr(text, "from-name") or from_addr
+            from_mode = header_attr(text, "from-mode") or "prompting"
+            msg_id = frame.get("msg_id") or str(uuid.uuid4())
+
+            event = {
+                "ts": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+                "msg_id": msg_id,
+                "agent": name,
+                "from": from_addr,
+                "from_name": from_name,
+                "from_mode": from_mode,
+                "text": text,
+                "frame": frame,
+            }
+            audit("agent_recv", agent=name, from_name=from_name, preview=preview(text))
+
+            if getattr(a, "fifo", None):
+                try:
+                    with open(a.fifo, "a") as ff:
+                        ff.write(json.dumps(event, ensure_ascii=False) + "\n")
+                except OSError as e:
+                    log(f"agent {name}: fifo write failed: {e}")
+
+            if getattr(a, "inbox", None):
+                try:
+                    os.makedirs(a.inbox, mode=0o700, exist_ok=True)
+                    write_json_private(os.path.join(a.inbox, f"{msg_id}.json"), event)
+                except OSError as e:
+                    log(f"agent {name}: inbox write failed: {e}")
+
+            if getattr(a, "exec", None):
+                try:
+                    p = subprocess.Popen(getattr(a, "exec"), shell=True, stdin=subprocess.PIPE)
+                    p.communicate(input=(json.dumps(event, ensure_ascii=False) + "\n").encode())
+                except OSError as e:
+                    log(f"agent {name}: exec failed: {e}")
+
+            if not getattr(a, "daemon", False) and not getattr(a, "fifo", None) and not getattr(a, "inbox", None) and not getattr(a, "exec", None):
+                print(json.dumps(event, ensure_ascii=False), flush=True)
+
+            if getattr(a, "once", False):
+                cleanup()
+
+    while True:
+        try:
+            c, _ = srv.accept()
+            threading.Thread(target=handle, args=(c,), daemon=True).start()
+        except OSError:
+            break
+
+
+def cmd_agent_wait(a):
+    name = label_ok(a.name)
+    a.kind = getattr(a, "kind", "generic") or "generic"
+    a.task = getattr(a, "task", None) or f"Waiting for message ({a.kind})"
+    a.fifo = None
+    a.inbox = None
+    a.exec = None
+    a.daemon = False
+    a.once = True
+    timeout = getattr(a, "timeout", 60)
+
+    pid = os.getpid()
+    os.makedirs(AGENTS_DIR, mode=0o700, exist_ok=True)
+    pid_file = os.path.join(AGENTS_DIR, f"{name}.pid")
+    write_json_private(pid_file, {"name": name, "pid": pid, "startedAt": now_ms(), "wait": True})
+
+    sdir = socket_dir()
+    os.makedirs(sdir, mode=0o700, exist_ok=True)
+    sock = os.path.join(sdir, f"{pid}.sock")
+    token = secrets.token_hex(16)
+    ps = proc_start(pid)
+    dom = pid_domain()
+    reg_path = os.path.join(SESSIONS_DIR, f"{pid}.json")
+    kpath = key_path(pid, sock)
+
+    srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        os.unlink(sock)
+    except OSError:
+        pass
+    srv.bind(sock)
+    os.chmod(sock, 0o600)
+    srv.listen(16)
+    if timeout > 0:
+        srv.settimeout(timeout)
+
+    sid = f"agent-{name}-{pid}"
+    kind = a.kind
+    task = a.task
+
+    def cleanup(exit_code=0):
+        for p in (reg_path, kpath, sock, pid_file):
+            try:
+                os.unlink(p)
+            except OSError:
+                pass
+        roster_drop(sid)
+        os._exit(exit_code)
+
+    try:
+        signal.signal(signal.SIGTERM, lambda *_: cleanup(1))
+        signal.signal(signal.SIGINT, lambda *_: cleanup(130))
+    except ValueError:
+        pass
+
+    write_json_private(kpath, {"peerToken": token, "procStart": ps, "pidDomain": dom})
+    now = now_ms()
+    reg = {
+        "pid": pid, "sessionId": sid, "cwd": os.getcwd(),
+        "startedAt": now, "procStart": ps, "version": f"ccm-agent-{VERSION}",
+        "peerProtocol": 1, "peerFeatures": ["agent_bridge"],
+        "kind": "interactive", "entrypoint": "cli", "pidDomain": dom,
+        "messagingSocketPath": sock, "name": name, "nameSource": "user",
+        "nameSince": now, "agent": f"ccm-agent-{kind}",
+        "status": "idle", "updatedAt": now, "statusUpdatedAt": now,
+        "ccmTask": task, "detail": f"[{kind}] {task}",
+    }
+    write_json_private(reg_path, reg)
+    roster_put(sid, pid=pid, name=name, cwd=os.getcwd(), task=task)
+
+    try:
+        while True:
+            c, _ = srv.accept()
+            buf = b""
+            c.settimeout(3)
+            try:
+                while len(buf) <= MAX_FRAME + 4096:
+                    d = c.recv(65536)
+                    if not d:
+                        break
+                    buf += d
+            except OSError:
+                pass
+            finally:
+                c.close()
+
+            lines = [l for l in buf.split(b"\n") if l.strip()]
+            if not lines:
+                continue
+            try:
+                first = json.loads(lines[0])
+            except ValueError:
+                continue
+            if first.get("type") != "auth" or not secrets.compare_digest(str(first.get("token", "")), token):
+                continue
+
+            for l in lines[1:]:
+                try:
+                    frame = json.loads(l)
+                except ValueError:
+                    continue
+                text = frame_text(frame)
+                from_addr = frame.get("from")
+                from_name = header_attr(text, "from-name") or from_addr
+                from_mode = header_attr(text, "from-mode") or "prompting"
+                msg_id = frame.get("msg_id") or str(uuid.uuid4())
+                event = {
+                    "ts": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+                    "msg_id": msg_id,
+                    "agent": name,
+                    "from": from_addr,
+                    "from_name": from_name,
+                    "from_mode": from_mode,
+                    "text": text,
+                    "frame": frame,
+                }
+                audit("agent_recv", agent=name, from_name=from_name, preview=preview(text))
+                print(json.dumps(event, ensure_ascii=False), flush=True)
+                cleanup(0)
+    except socket.timeout:
+        sys.stderr.write(f"ccm agent wait: timeout after {timeout}s\n")
+        cleanup(2)
+    except OSError:
+        cleanup(1)
+
+
+def cmd_agent_status(a):
+    os.makedirs(AGENTS_DIR, mode=0o700, exist_ok=True)
+    res = []
+    for f in os.listdir(AGENTS_DIR):
+        if not f.endswith(".pid"):
+            continue
+        name = f[:-4]
+        d = read_json(os.path.join(AGENTS_DIR, f), {})
+        pid = d.get("pid")
+        alive = bool(pid and pid_alive(pid))
+        rec = next((r for r in read_sessions() if r.get("pid") == pid and r.get("name") == name), None)
+        res.append({
+            "name": name,
+            "pid": pid,
+            "alive": alive,
+            "wait": d.get("wait", False),
+            "startedAt": d.get("startedAt"),
+            "task": (rec or {}).get("ccmTask"),
+            "sock": (rec or {}).get("messagingSocketPath"),
+        })
+    if getattr(a, "json", False):
+        print(json.dumps(res, indent=2, ensure_ascii=False))
+    else:
+        if not res:
+            print("No active agent bridges.")
+            return
+        for r in res:
+            st = "running" if r["alive"] else "stale"
+            print(f"agent {r['name']}: {st} (pid {r['pid']}) — {r['task'] or '-'}")
+
+
+def cmd_agent_stop(a):
+    name = label_ok(a.name)
+    pid_file = os.path.join(AGENTS_DIR, f"{name}.pid")
+    d = read_json(pid_file, {})
+    pid = d.get("pid")
+    if not pid or not pid_alive(pid):
+        try:
+            os.unlink(pid_file)
+        except OSError:
+            pass
+        print(f"agent bridge '{name}' not running.")
+        return
+    try:
+        os.kill(pid, signal.SIGTERM)
+        for _ in range(20):
+            if not pid_alive(pid):
+                break
+            time.sleep(0.1)
+        if pid_alive(pid):
+            os.kill(pid, signal.SIGKILL)
+        print(f"stopped agent bridge '{name}' (PID {pid}).")
+    except OSError as e:
+        sys.exit(f"failed to stop {name}: {e}")
 
 
 def main():
@@ -1490,15 +3170,47 @@ def main():
     p = sp.add_parser("task", help="show/set this session's task"); p.add_argument("text", nargs="*"); p.set_defaults(fn=cmd_task)
     p = sp.add_parser("log", help="audit trail"); p.add_argument("-n", type=int, default=40); p.add_argument("-f", "--follow", action="store_true")
     p.add_argument("--ev"); p.add_argument("--json", action="store_true"); p.set_defaults(fn=cmd_log)
-    p = sp.add_parser("config"); p.add_argument("action", choices=["show", "set-label", "set-preview"], nargs="?", default="show")
+    p = sp.add_parser("receipts", help="delivery facts; no message bodies"); p.add_argument("--inbox", action="store_true"); p.add_argument("--json", action="store_true"); p.set_defaults(fn=cmd_receipts)
+    p = sp.add_parser("read-ack", help="owned receiving session declares acknowledgement, not human approval"); p.add_argument("id"); p.set_defaults(fn=cmd_read_ack)
+    p = sp.add_parser("retry", help="explicit retry of a safely pending message"); p.add_argument("id"); p.add_argument("--inbox", action="store_true"); p.set_defaults(fn=cmd_retry)
+    p = sp.add_parser("config"); p.add_argument("action", choices=["show", "set-label", "set-preview", "set-read-receipts", "set-retry", "set-reliability"], nargs="?", default="show")
     p.add_argument("value", nargs="?"); p.set_defaults(fn=cmd_config)
     p = sp.add_parser("hook"); p.add_argument("event", choices=["session-start", "prompt", "permission", "sent", "session-end"]); p.set_defaults(fn=cmd_hook)
     p = sp.add_parser("link"); p.add_argument("host"); p.set_defaults(fn=cmd_link)
     p = sp.add_parser("serve"); p.add_argument("--label"); p.set_defaults(fn=cmd_serve)
     p = sp.add_parser("mirror"); p.add_argument("--name", required=True); p.add_argument("--peer", required=True)
     p.add_argument("--remote", required=True); p.set_defaults(fn=cmd_mirror)
+    p = sp.add_parser("agent", help="bridge external agents (Antigravity, Codex, etc.)")
+    asp = p.add_subparsers(dest="action", required=True)
+    p_serve = asp.add_parser("serve", help="run agent bridge listener")
+    p_serve.add_argument("name")
+    p_serve.add_argument("--kind", default="generic", choices=["generic", "antigravity", "codex"])
+    p_serve.add_argument("--task")
+    p_serve.add_argument("--fifo")
+    p_serve.add_argument("--inbox")
+    p_serve.add_argument("--exec")
+    p_serve.add_argument("--daemon", action="store_true")
+    p_serve.add_argument("--once", action="store_true")
+    p_serve.add_argument("--timeout", type=float, default=0)
+    p_serve.set_defaults(fn=cmd_agent)
+    p_wait = asp.add_parser("wait", help="wait for one incoming message and exit")
+    p_wait.add_argument("name")
+    p_wait.add_argument("--kind", default="generic")
+    p_wait.add_argument("--task")
+    p_wait.add_argument("--timeout", type=float, default=60)
+    p_wait.set_defaults(fn=cmd_agent)
+    p_status = asp.add_parser("status", help="list running agent bridges")
+    p_status.add_argument("name", nargs="?")
+    p_status.add_argument("--json", action="store_true")
+    p_status.set_defaults(fn=cmd_agent)
+    p_stop = asp.add_parser("stop", help="stop a running agent bridge")
+    p_stop.add_argument("name")
+    p_stop.set_defaults(fn=cmd_agent)
     a = ap.parse_args()
-    a.fn(a)
+    try:
+        a.fn(a)
+    except (ReliabilityError, sqlite3.Error):
+        sys.exit("reliability operation failed closed; state retained for reconciliation")
 
 
 if __name__ == "__main__":

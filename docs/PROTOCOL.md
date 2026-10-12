@@ -68,6 +68,45 @@ envelope. Limit is roughly 1 MB per line. The receiver:
   sender is held by a bypass recipient,
 - replies by connecting to the `from` address, which must be a local socket.
 
+## Native status controls (not reading)
+
+The observed native control shape uses top-level `type=control`,
+`action=peer_message_status`, `status`, and optional `orig_msg_id`. The control's
+own `msg_id` is **not** the original message ID. Observed admission states are
+held, denied, expired, delivered, refused and dropped. Refusal may be encoded as
+`status=expired,status_detail=refused`; direct refused is also accepted. Dropped
+may include `drop_reason` and `dropped_msg_ids` containing original send IDs.
+Reason contents and other transport options are not invented as wire fields.
+`delivered` means queue admission (including release after a hold), not model
+consumption. No consumed/read control has been established.
+
+CCM correlates these facts only against an existing send, its authenticated paired
+channel, original source/target SIDs and both PID generations. It does not infer a
+SID from native `from`, change targets, or match a naked ID across all records.
+Unknown actions/literals and native permission/control fields are forwarded
+unchanged. Terminal denial/drop/refusal cannot be undone by late transport ACKs.
+
+## CCM reliability envelope
+
+This is a CCM protocol layered on the existing paired SSH channel, **not new
+Claude native fields**. Hello advertises schema 1, persistent node ID and store
+incarnation. The existing OS/SSH account authenticates the channel; label and UUID
+are identity assertions, not additional authority.
+
+`reliable_deliver` contains stable per-target delivery ID, origin node/incarnation,
+fixed source/target SIDs and source generation, original native frame, creation
+and expiry, receipt request and immutable fingerprint. Inbox acceptance and
+native-ID mapping are one SQLite transaction. A conflicting ID cannot change its
+target, body or lifetime. `receipt`/`receipt_ack` carry durable receive, native
+handoff or explicit receiver declaration facts and are idempotent control-plane
+traffic. They never become LLM messages or an ACK-of-ACK loop.
+
+The local authenticated mirror also accepts private `ccm_local` wakeups for an
+owned receipt or safe receiver retry. They are intercepted locally, never
+forwarded to the native session. They do not alter native bodies or permission
+classes. Legacy `deliver`/`ack` remain compatible, but a legacy socket-write ACK
+is not promoted to a durable receive or read fact, nor replayed after an upgrade.
+
 ## Canonical identity envelope
 
 In 2.1.282 the receiver recognizes a complete, canonical envelope, not arbitrary

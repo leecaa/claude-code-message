@@ -82,11 +82,35 @@ rm ~/.local/bin/ccm; rm -rf ~/.local/state/claude-code-message ~/.config/claude-
 | Roster shows departed sessions | These are swept automatically within 2 min of the session disappearing. |
 | Audit log too big | It rotates at 20 MB to `audit.jsonl.1`. |
 
+### Durable delivery recovery
+
+1. Inspect `ccm receipts --json` (or owned `--inbox`) before another send. Querying
+   is not a read acknowledgement. `queued`/`peer_received`/native handoff and
+   receiver_acknowledged are separate boundaries.
+2. Default read-receipt and resend tracking is enabled. Use
+   `ccm config set-read-receipts false` and `ccm config set-retry false` independently;
+   only JSON booleans are accepted. Receiver-off wins over requests, and enabling
+   later does not reveal previously suppressed declarations.
+3. `ccm retry ID` preserves the original fixed SID, body and budgets. Only pending
+   safe paths qualify. A native unknown/partial write, a legacy attempt, held/refused
+   or expiry cannot be forced into another injection. Recipient `read-ack ID` is an
+   explicit owned-session declaration, never proof of human consent.
+4. The existing `ccm up` worker also recovers local queues with zero peers. If all
+   workers are stopped, durable state stays pending; it does not self-execute.
+   Restart/update only through the normally authorized procedure, not to bypass
+   receiver policy. Native sends to local non-mirror peers still bypass CCM queues.
+5. Keep the private database, identity marker and replay metadata together. Do not
+   delete or restore a fragment to make an unknown send look new. Database identity
+   drift pauses old work. Payload expiry is fixed, tombstones outlive the replay
+   window; config revision interruption and clock rollback fail closed. Backups may
+   contain raw bodies even when audit previews are disabled.
+
 ## Files
 
 | Path | What |
 |---|---|
-| `~/.config/claude-code-message/config.json` | label, peers, `audit_preview_chars` (0 = do not store message text) |
+| `~/.config/claude-code-message/config.json` | label, peers, audit preview, strict reliability/privacy settings and durable policy revision |
+| `~/.local/state/claude-code-message/reliability.sqlite3` and identity marker | private raw-body queue, dedup, independent receipt facts and budgets; not a public artifact |
 | `~/.local/state/claude-code-message/audit.jsonl` | the audit trail (both machines keep their own) |
 | `~/.local/state/claude-code-message/roster/` | one file per local session: its task |
 | `~/.local/state/claude-code-message/{daemon.log,status.json,counters.json}` | daemon log, live status, all-time counters |

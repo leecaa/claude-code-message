@@ -78,8 +78,17 @@ an envelope nor a shared-account token proves that a particular LLM wrote text.
   them as local-only verification commands when remote operations are not intended.
 - Test a new session's first `ccm send` and `ccm broadcast`, then another send after
   a mode change. Matching declared classes should deliver without a parity dialog.
-- The CLI's `ok` is a socket-write result, **not proof of model delivery**. Confirm
-  receipt in the destination; explicit inbound policy can still hold or drop it.
+- The old CLI's `ok` is a socket-write result. The durable CLI's `queued` is only
+  local acceptance, and peer_received is only the CCM inbox commit. Neither is
+  proof of model delivery; native policy can still hold or drop the handoff.
+- Default-enabled receipt tracking never observes human reading or approval.
+  `read-ack` is the actual ancestor-owned target SID/generation's explicit
+  receiver_acknowledged declaration after handoff. Queries/hooks/idle/Stop do not
+  create it. Disabling receiver disclosure overrides requests; late ACK/admission
+  cannot reopen suppressed, refused, expired or unknown handoffs.
+- Retries retain the original body/native ID/permission provenance and fixed SID.
+  No model/auth/defaultMode/inbound-policy change, alternate actor or same-name
+  retarget is used to turn a hold or denial into success.
 - Run all isolated tests with `python3 -m unittest discover -s tests -v`.
   The subprocess integration tests use temporary registries and local sockets,
   never real sessions, SSH, or model calls. `TMPDIR` can select their scratch root.

@@ -1,2 +1,8 @@
 __pycache__/
 *.pyc
+reliability.sqlite3*
+reliability-identity.json
+reliability.lock
+.ccm-state/
+.pytest_cache/
+.test-tmp/

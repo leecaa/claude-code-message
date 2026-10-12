@@ -53,9 +53,65 @@ member.
 | `ccm roster` | members, where they run, what they work on |
 | `ccm send NAME TEXT` / `ccm broadcast TEXT [--node N] [--local] [--match RE]` | message from the CLI or from an agent's Bash |
 | `ccm task [TEXT]` | show or set this session's task |
+| `ccm agent serve` / `wait` / `status` / `stop` | bridge Antigravity, Codex & external agents as interactive peers |
 | `ccm log [-f] [-n N] [--ev E,…]` | audit trail |
 | `ccm status` / `ccm doctor` | health (counters survive reconnects) |
 | `ccm pair` / `unpair` / `up` / `down` / `restart` | lifecycle |
+
+## Receipts and bounded resend
+
+Both `read_receipts` and `retry_enabled` default to `true`. They are independent:
+
+```bash
+ccm config set-read-receipts false
+ccm config set-retry false
+ccm config set-reliability '{"message_ttl":3600,"max_attempts":128}'
+ccm receipts --json                 # sender-side facts, never message bodies
+ccm receipts --inbox --json         # only the current owned receiving SID
+ccm read-ack DELIVERY_ID            # explicit receiving-session declaration
+ccm retry DELIVERY_ID               # only a safely pending original message
+ccm retry DELIVERY_ID --inbox       # safe pre-write receiver retry
+```
+
+`queued` means a private SQLite transaction accepted the message. `peer_received`
+means the paired CCM endpoint committed its inbox and dedup record. Neither means
+Claude read it. `socket_written_unconfirmed` is a native socket handoff, not
+queue admission. Native `delivered` is admission, not reading. The only read-style
+fact is **`receiver_acknowledged`**: the actual ancestor-owned target session
+explicitly declares it after a handoff. Model consumption, human reading and
+human approval remain unknown; hooks, queries, idle and Stop never manufacture
+that declaration.
+
+New paired endpoints replay the same delivery ID with exponential backoff and
+persistent receiver dedup. The defaults are 2–300 seconds, ±20% jitter, a
+10-second ACK wait, 512 attempts and a fixed 24-hour TTL. A peer database identity
+change pauses old queues. Targets are frozen SIDs, not names; `sid:SID` can address
+a previously observed unique offline route. Broadcast accepts its frozen targets
+in one transaction. No live worker means no automatic progress: the existing
+`ccm up` daemon also supports local-only recovery with no peers.
+
+An uncertain native handoff is deliberately **not injected again**. A crash after
+dispatch reservation, partial write or post-write commit failure remains
+`handoff_unknown`; this trades liveness for avoiding duplicate work. A legacy
+peer is attempted once and remains unconfirmed, even after a later upgrade.
+There is no end-to-end exactly-once or guaranteed eventual delivery claim.
+Disabling retry stops new background timer/reconnect/restart attempts, while explicit
+safe commands get one durable opportunity. Duplicate ingress never grants another
+native handoff; reactive peer_received transport responses use persistent attempts,
+lease and backoff even with retry off, not an unmetered ACK exception. First handoff
+control facts and the read declaration's generation dependency remain independent
+of automatic retry. Held/refused/expired messages are not unlocked.
+Disabling read receipts on the receiver suppresses future disclosure, including
+pending events; re-enabling does not replay suppressed declarations. IO already
+started cannot be withdrawn.
+
+The queue stores **raw message bodies**, unlike redacted audit previews: keep its
+0700 directory and 0600 database private. Active bodies are bounded to 10,000 /
+64 MiB; the total store/journal budget is 256 MiB with ACK headroom. Tombstones
+cover the immutable expiry plus clock-skew and retention margins. Clock rollback,
+corrupt configuration and incompatible schemas fail closed. Do not remove or
+restore only part of reliability state to force a resend. See the
+[architecture](docs/ARCHITECTURE.md) and [security policy](SECURITY.md).
 
 ## Message trust and first delivery
 
@@ -73,12 +129,15 @@ steps and the limits of “trusted Claude” on a shared OS account.
 
 - [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md): design, lifecycles, audit
   schema, security (single source of truth)
+- [docs/AGENT-BRIDGE.md](docs/AGENT-BRIDGE.md): Agent Bridge architecture for
+  Google Antigravity, OpenAI Codex, and external autonomous agents
 - [skills/claude-code-message/references/sop.md](skills/claude-code-message/references/sop.md):
   procedures for pairing, upgrading, recovery and uninstalling
 - [docs/PROTOCOL.md](docs/PROTOCOL.md): the Claude Code peer protocol this
   builds on
 - [SECURITY.md](SECURITY.md): security architecture, threat model, and vulnerability reporting
 - 简体中文: [README.zh-CN.md](README.zh-CN.md),
+  [docs/i18n/zh-CN/AGENT-BRIDGE.md](docs/i18n/zh-CN/AGENT-BRIDGE.md),
   [docs/i18n/zh-CN/SOP.md](docs/i18n/zh-CN/SOP.md)
 
 ## Security in one paragraph
