@@ -1,14 +1,45 @@
 # Agent Bridge Architecture: Integrating External AI Agents into Claude Code Message
 
-## 1. Overview
+> **Feature Status: Experimental / Optional (探索性 / 可选阶段)**  
+> **Recommended Production Pattern**: Asymmetric Coordination — `tmux send-keys` for downlink task dispatching from Claude/Orchestrator to AGY, coupled with native `ccm send` for one-way uplink feedback from AGY to Claude.
 
-**Claude Code Message (CCM)** connects AI coding agent sessions across developer machines. While originally built for native Claude Code CLI sessions, CCM's underlying Unix Domain Socket (UDS) peer protocol and session registry can be bridged to support non-Claude autonomous agents—most notably **Google Antigravity (AGY)** and **OpenAI Codex**—as first-class citizens.
+## 1. Overview & Architecture Tiers
 
-With the **CCM Agent Bridge (`ccm agent`)**, external agents can:
-1. **Advertise themselves** on the CCM network with a valid name, live PID, and registered task (appearing in `ccm roster`).
-2. **Actively receive messages** sent by Claude Code sessions or other peers via standard `SendMessage` or `ccm send`.
-3. **Trigger reactive execution loops** in host runtimes (e.g., Antigravity's Reactive Background Task Wakeup or Codex's Lifecycle Hooks).
-4. **Dispatch messages back** to Claude or remote peers with authenticated identity envelopes.
+**Claude Code Message (CCM)** connects AI coding agent sessions across developer machines. While originally built for native Claude Code CLI sessions, CCM provides an extensible Unix Domain Socket (UDS) peer protocol and session registry that can interface with external autonomous agents—most notably **Google Antigravity (AGY)** and **OpenAI Codex**.
+
+### 1.1. Architecture Tiers
+
+Following rigorous cross-device audits (including message delivery, automated wakeup, and read receipts), the integration is divided into two operational tiers:
+
+```
+┌────────────────────────────────────────────────────────────────────────┐
+│               Tier 1: Recommended Production Architecture              │
+│                 (Asymmetric Deterministic Coordination)                │
+└────────────────────────────────────────────────────────────────────────┘
+  Downlink (Claude ➔ AGY):                                                
+    Claude / Orchestrator dispatches prompt via tmux:                    
+    `tmux send-keys -t agy "Execute Task #X with prompt..." Enter`       
+    ➔ Deterministic prompt injection, guaranteed conversation startup.   
+
+  Uplink (AGY ➔ Claude):                                                 
+    AGY completes task and reports back via native CCM:                  
+    `ccm send --as mac-agy "mac任务汇总" "Task #X completed: ..."`       
+    ➔ 100% reliable, low-overhead, native UDS delivery to Claude.        
+
+──────────────────────────────────────────────────────────────────────────
+
+┌────────────────────────────────────────────────────────────────────────┐
+│               Tier 2: Experimental Full-Duplex Daemon                  │
+│                        (Optional / Exploratory)                        │
+└────────────────────────────────────────────────────────────────────────┘
+  Bidirectional IPC Emulation (`ccm agent serve` / `wait` / Inbox):      
+    - Emulates Claude UDS endpoint for external agents.                  
+    - Dependent on host runtime wakeup capabilities (e.g., AGY subagent  
+      inbox polling, lifecycle hooks, or blocking `ccm agent wait`).     
+    - Current Caveat: Unattended automated wakeup and structured         
+      `receiver_acknowledged` read-receipt loops in host agents remain    
+      exploratory due to IDE/CLI host sandbox constraints.               
+```
 
 ---
 

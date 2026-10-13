@@ -1,14 +1,44 @@
 # 跨 Agent 桥接架构：将 Antigravity 与 Codex 等外部 Agent 接入 Claude Code Message
 
-## 1. 概述与设计理念
+> **特性状态：探索性 / 可选阶段 (Experimental / Optional)**  
+> **推荐生产级闭环架构**：不对称协作模式 —— **下行指令 (Claude ➔ AGY)** 采用 `tmux send-keys` 注入提示词拉起执行；**上行回传 (AGY ➔ Claude)** 采用成熟的原生 `ccm send` 单向高效回报。
 
-**Claude Code Message (CCM)** 本质上是一套跨主机的 AI Agent 对等会话协作网络。虽然最初针对 Claude Code 原生交互会话设计，但其底层的 Unix Domain Socket (UDS) 进程间通信（IPC）机制与会话发现注册表可以被通用化扩展，从而支持 **Google Antigravity (AGY)**、**OpenAI Codex** 等第三方自主 Agent 作为一等公民深度接入。
+## 1. 概述与架构分级
 
-借助 **CCM Agent Bridge (`ccm agent`)**，外部 Agent 能够：
-1. **作为正式节点上线**：自动写入符合协议的活体会话注册表，携带真实 PID、运行状态与任务描述，在 `ccm roster` 中与 Claude 会话平权可见。
-2. **主动接收消息**：直接接收来自 Claude 或远程机器通过 `SendMessage` 或 `ccm send` 投递的消息，无需无意义的盲轮询。
-3. **驱动原生思考唤醒**：无缝对接 Antigravity 的 **响应式后台任务唤醒 (Reactive Background Task Wakeup)** 或 Codex 的 **生命周期钩子 (Hooks)**，自动拉起下一个思考 Turn。
-4. **反向双向回复**：Agent 执行完成后，直接通过 `ccm send` 沿经过认证的身份信封回传成果。
+**Claude Code Message (CCM)** 本质上是一套跨主机的 AI Agent 对等会话协作网络。虽然最初针对 Claude Code 原生交互会话设计，但其底层的 Unix Domain Socket (UDS) 进程间通信（IPC）机制与会话发现注册表可以被通用化扩展，从而支持 **Google Antigravity (AGY)**、**OpenAI Codex** 等第三方自主 Agent 接入。
+
+### 1.1. 架构分级与工程选型
+
+经过多设备实机审计（涵盖消息投递、自动唤醒与结构化已读回执），跨 Agent 协同分为两个实践层级：
+
+```
+┌────────────────────────────────────────────────────────────────────────┐
+│                   Tier 1: 推荐生产级闭环架构                            │
+│                 (不对称确定性协作模式，当前稳定推荐)                       │
+└────────────────────────────────────────────────────────────────────────┘
+  下行指令 (Claude ➔ AGY):                                                
+    Claude / 总控通过 tmux 会话注入提示词拉起执行：                       
+    `tmux send-keys -t agy "执行 Task #X 提示词..." Enter`                
+    ➔ 保证确定性上下文启动，避免空闲 Agent 无法无感唤醒的问题。          
+
+  上行回传 (AGY ➔ Claude):                                                 
+    AGY 完成任务后通过原生 CCM 单向回传：                                  
+    `ccm send --as mac-agy "mac任务汇总" "Task #X 终态汇报: ..."`          
+    ➔ 100% 可靠、零额外开销、原生写入 Claude Code 会话队列。              
+
+──────────────────────────────────────────────────────────────────────────
+
+┌────────────────────────────────────────────────────────────────────────┐
+│                   Tier 2: 探索性全双工守护模式                          │
+│                        (可选 / 实验阶段)                               │
+└────────────────────────────────────────────────────────────────────────┘
+  双向 IPC 模拟 (`ccm agent serve` / `wait` / Inbox 监听):                
+    - 为外部 Agent 模拟 Claude 原生 UDS 会话注册表与收件箱。              
+    - 依赖宿主环境的唤醒能力（如 AGY 子代理轮询、Stop Hook 或 wait 阻塞）。
+    - 已知工程局限：由于 IDE / 终端宿主沙箱限制，无人干预下的自动唤醒与   
+      结构化已读状态 (`receiver_acknowledged`) 闭环仍具不确定性，现阶段    
+      定位于探索与实验特性。                                             
+```
 
 ---
 
