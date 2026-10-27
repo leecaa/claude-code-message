@@ -212,6 +212,27 @@ class T(unittest.TestCase):
         self.assertIn("server-uat [server, idle]: remote task", out["additionalContext"])
         self.assertIsNotNone(c.roster_get("me"))
 
+    def test_task_from_prompt_filters_system_notices(self):
+        c = self.ccm
+        # Internal turn notices injected by Claude Code should not be parsed as user tasks
+        self.assertIsNone(c.task_from_prompt('● Background command "check status" completed (exit code 0)'))
+        self.assertIsNone(c.task_from_prompt('● Dynamic workflow "run build" completed · 48m 21s'))
+        self.assertIsNone(c.task_from_prompt('● Read agent output btef0587u'))
+        self.assertIsNone(c.task_from_prompt('› Message from @peer: hello'))
+        # Legitimate user prompt should still be parsed
+        self.assertEqual(c.task_from_prompt("请帮我修复编译报错并提交代码"), "请帮我修复编译报错并提交代码")
+
+    def test_hook_permission_short_circuits(self):
+        c = self.ccm
+        # No permission mode specified
+        c.hook_permission({"session_id": "s1"})
+        self.assertIsNone(c.roster_get("s1"))
+        # Same permission mode does not trigger find_session / proc inspection
+        c.roster_put("s1", permission={"mode": "bypass"})
+        with patch.object(c, "find_session") as mock_find:
+            c.hook_permission({"session_id": "s1", "permission_mode": "bypass"})
+            mock_find.assert_not_called()
+
 
 if __name__ == "__main__":
     unittest.main()

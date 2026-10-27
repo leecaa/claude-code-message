@@ -1222,24 +1222,38 @@ def roster_get(sid):
     return read_json(roster_path(sid)) if sid else None
 
 
+def _acquire_flock(fd, timeout=1.0):
+    deadline = time.time() + timeout
+    while True:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return True
+        except (BlockingIOError, OSError):
+            if time.time() >= deadline:
+                return False
+            time.sleep(0.02)
+
+
 def roster_put(sid, **kw):
     clean_sid = re.sub(r'[^A-Za-z0-9-]', '', sid)
     lock_path = os.path.join(ROSTER_DIR, f"{clean_sid}.lock")
     os.makedirs(ROSTER_DIR, mode=0o700, exist_ok=True)
     try:
         lock_fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+        locked = False
         try:
-            fcntl.flock(lock_fd, fcntl.LOCK_EX)
+            locked = _acquire_flock(lock_fd, timeout=1.0)
             cur = roster_get(sid) or {"sessionId": sid, "joinedAt": now_ms()}
             cur.update({k: v for k, v in kw.items() if v is not None})
             cur["updatedAt"] = now_ms()
             write_json_private(roster_path(sid), cur)
             return cur
         finally:
-            try:
-                fcntl.flock(lock_fd, fcntl.LOCK_UN)
-            except OSError:
-                pass
+            if locked:
+                try:
+                    fcntl.flock(lock_fd, fcntl.LOCK_UN)
+                except OSError:
+                    pass
             os.close(lock_fd)
     except OSError:
         cur = roster_get(sid) or {"sessionId": sid, "joinedAt": now_ms()}
@@ -1329,9 +1343,9 @@ def infer_task(rec):
     return task
 
 
-# text Claude Code injects as user turns: peer messages, skill bodies, resumes
+# text Claude Code injects as user turns: peer messages, skill bodies, resumes, command/workflow notices
 NOT_A_TASK = ("<", "/", "[Request interrupted", "Another Claude session", "Base directory for this skill",
-              "This session is being continued", "Caveat:")
+              "This session is being continued", "Caveat:", "● ", "› ")
 
 
 def task_from_prompt(p):
@@ -2527,19 +2541,42 @@ def hook_input():
 
 
 def find_session(sid):
-    for r in read_sessions():
-        if r.get("sessionId") == sid:
-            return r
+    if not sid:
+        return None
+    try:
+        names = os.listdir(SESSIONS_DIR)
+    except OSError:
+        return None
+    for n in names:
+        if not re.fullmatch(r"\d+\.json", n):
+            continue
+        rec = read_json(os.path.join(SESSIONS_DIR, n))
+        if not isinstance(rec, dict) or rec.get("sessionId") != sid:
+            continue
+        pid = rec.get("pid")
+        if not isinstance(pid, int) or pid <= 0 or not pid_alive(pid) or not rec.get("messagingSocketPath"):
+            continue
+        if not rec.get("procStart") or rec["procStart"] != proc_start(pid):
+            continue
+        if not rec.get("pidDomain") or rec["pidDomain"] != pid_domain():
+            continue
+        return rec
     return None
 
 
 def hook_permission(inp):
     sid = inp.get("session_id")
-    rec = find_session(sid) if sid else None
-    if not rec or rec["pid"] not in ancestor_pids():
+    if not sid:
+        return
+    mode = inp.get("permission_mode")
+    cur = roster_get(sid)
+    if cur and (cur.get("permission") or {}).get("mode") == mode:
+        return
+    rec = find_session(sid)
+    if not rec or rec.get("pid") not in ancestor_pids():
         return
     permission = {k: rec[k] for k in ("sessionId", "pid", "procStart", "pidDomain")}
-    permission["mode"] = inp.get("permission_mode")
+    permission["mode"] = mode
     roster_put(sid, permission=permission)
 
 
@@ -2566,9 +2603,11 @@ def hook_session_start(inp):
 
 def hook_prompt(inp):
     hook_permission(inp)
-    task = task_from_prompt(inp.get("prompt"))
     sid = inp.get("session_id")
-    if not task or not sid:
+    if not sid:
+        return
+    task = task_from_prompt(inp.get("prompt"))
+    if not task:
         return
     cur = roster_get(sid) or {}
     if cur.get("task") == task:

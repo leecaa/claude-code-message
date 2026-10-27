@@ -4,16 +4,16 @@
       { "hooks": [ { "type": "command", "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/bin/ccm\" hook session-start", "timeout": 15 } ] }
     ],
     "UserPromptSubmit": [
-      { "hooks": [ { "type": "command", "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/bin/ccm\" hook prompt", "timeout": 5 } ] }
+      { "hooks": [ { "type": "command", "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/bin/ccm\" hook prompt", "timeout": 15 } ] }
     ],
     "PreToolUse": [
-      { "matcher": "Bash|SendMessage", "hooks": [ { "type": "command", "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/bin/ccm\" hook permission", "timeout": 5 } ] }
+      { "matcher": "Bash|SendMessage", "hooks": [ { "type": "command", "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/bin/ccm\" hook permission", "timeout": 15 } ] }
     ],
     "PostToolUse": [
-      { "matcher": "SendMessage", "hooks": [ { "type": "command", "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/bin/ccm\" hook sent", "timeout": 5 } ] }
+      { "matcher": "SendMessage", "hooks": [ { "type": "command", "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/bin/ccm\" hook sent", "timeout": 15 } ] }
     ],
     "SessionEnd": [
-      { "hooks": [ { "type": "command", "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/bin/ccm\" hook session-end", "timeout": 5 } ] }
+      { "hooks": [ { "type": "command", "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/bin/ccm\" hook session-end", "timeout": 15 } ] }
     ]
   }
 }
